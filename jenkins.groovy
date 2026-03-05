@@ -248,7 +248,7 @@ pipeline {
         )
         choice(
             name: 'RUNTIME_VERSION',
-            choices: ['18.1', '18.0', '18.4', '17.5', '16.4'],
+            choices: ['26.3.1', '18.0'],
             description: 'iOS runtime version'
         )
         choice(
@@ -427,7 +427,7 @@ _Commits:_
                             bundle install
 
                             export SPM_CACHE_DIR="${SPM_CACHE_DIR}"
-                            bundle exec rake buildspecs[${params.SCHEME_NAME}]
+                            bundle exec rake "buildspecs[${params.SCHEME_NAME}]"
                         """
                     }
 
