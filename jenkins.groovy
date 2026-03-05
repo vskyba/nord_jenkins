@@ -64,28 +64,32 @@ def uploadFileToSlack(String filePath, String text, String channel, String threa
     }
 }
 
+/**
+ * Reads test counts from JUnit XML (fla-ios Reports.summary_counts).
+ * Returns [failed:, executed:, disabled:] as strings; uses 'null' when file missing or parse fails.
+ * Ruby -e is single-quoted with path in JUNIT_PATH to avoid zsh glob on [...].
+ */
 def readTestCountersFromJunit(String junitPath) {
+    def counters = [failed: 'null', executed: 'null', disabled: 'null']
     if (!fileExists(junitPath)) {
-        return [failed: '0', executed: '0', disabled: '0']
+        return counters
     }
 
+    // Call fla-ios Ruby: path via env so -e can be single-quoted (avoids zsh glob on counts[:failed])
     def result = sh(
         script: """
-            bundle exec ruby -r ./ruby/project/test.rb -e "
-                counts = Project::Test::Reports.summary_counts('${junitPath}')
-                puts \"failed=#{counts[:failed]}\"
-                puts \"executed=#{counts[:executed]}\"
-                puts \"disabled=#{counts[:disabled]}\"
-            " 2>/dev/null || echo "failed=0\\nexecuted=0\\ndisabled=0"
+            export JUNIT_PATH="${junitPath}"
+            bundle exec ruby -r ./ruby/project/test.rb -e 'counts = Project::Test::Reports.summary_counts(ENV[\"JUNIT_PATH\"]); puts \"failed=\" + counts[:failed].to_s; puts \"executed=\" + counts[:executed].to_s; puts \"disabled=\" + counts[:disabled].to_s' 2>/dev/null || true
         """,
         returnStdout: true
     ).trim()
 
-    def counters = [failed: '0', executed: '0', disabled: '0']
     result.split('\n').each { line ->
-        def parts = line.split('=')
+        def parts = line.split('=', 2)
         if (parts.size() == 2) {
-            counters[parts[0].trim()] = parts[1].trim()
+            def key = parts[0].trim()
+            def val = parts[1].trim()
+            if (counters.containsKey(key)) { counters[key] = val }
         }
     }
     return counters
@@ -126,6 +130,8 @@ def runXCUITests(Map config) {
         "-parallel-testing-enabled YES -parallel-testing-worker-count ${config.workers}"
 
     def testMethodsArg = config.testMethods ?: ''
+    // Reuse Build stage DerivedData (prebuild-once strategy, same as squad_specific_test_run.yml)
+    def derivedDataPath = config.derivedDataPath ?: "${config.outputDir}/DerivedData"
 
     def exitCode = sh(
         script: """
@@ -138,7 +144,7 @@ def runXCUITests(Map config) {
                 -destination "platform=iOS Simulator,name=${config.device},OS=${config.runtime}" \
                 ${parallelOptions} \
                 -onlyUsePackageVersionsFromResolvedFile \
-                -derivedDataPath "${config.outputDir}/DerivedData" \
+                -derivedDataPath "${derivedDataPath}" \
                 -resultBundlePath "${config.outputDir}/${config.resultName}.xcresult" \
                 -skipPackagePluginValidation \
                 -quiet \
@@ -164,30 +170,28 @@ def generateJunitReport(String xcresultPath, String outputPath) {
     """
 
     if (fileExists(outputPath)) {
-        // Fix failure messages using Ruby script
+        // Fix failure messages (path via env to avoid zsh glob in -e)
         sh """
-            bundle exec ruby -r ./ruby/project/test.rb -e "
-                Project::Test.fix_junit_failure_messages('${outputPath}')
-            " 2>/dev/null || true
+            export JUNIT_FIX_PATH="${outputPath}"
+            bundle exec ruby -r ./ruby/project/test.rb -e 'Project::Test.fix_junit_failure_messages(ENV[\"JUNIT_FIX_PATH\"])' 2>/dev/null || true
         """
     }
 }
 
 def generateFailedTestsCsv(String junitPath, String csvPath) {
     sh """
-        bundle exec ruby -r ./ruby/project/test.rb -e "
-            Project::Test::Reports.generate_failed_tests_to_csv('${junitPath}', '${csvPath}')
-        " 2>/dev/null || ~/scripts/genFailedFromXML.py ${junitPath} || true
+        export JUNIT_CSV_IN="${junitPath}"
+        export JUNIT_CSV_OUT="${csvPath}"
+        bundle exec ruby -r ./ruby/project/test.rb -e 'Project::Test::Reports.generate_failed_tests_to_csv(ENV[\"JUNIT_CSV_IN\"], ENV[\"JUNIT_CSV_OUT\"])' 2>/dev/null || ~/scripts/genFailedFromXML.py \"${junitPath}\" || true
     """
 }
 
 def extractFailedTestMethods(String junitPath, String scheme) {
     return sh(
         script: """
-            bundle exec ruby -r ./ruby/project/test.rb -e "
-                result = Project::Test.failed_tests_from_xml('${junitPath}', '${scheme}')
-                puts result
-            " 2>/dev/null || echo ""
+            export XML_PATH="${junitPath}"
+            export SCHEME_NAME="${scheme}"
+            bundle exec ruby -r ./ruby/project/test.rb -e 'result = Project::Test.failed_tests_from_xml(ENV[\"XML_PATH\"], ENV[\"SCHEME_NAME\"]); puts result' 2>/dev/null || echo ""
         """,
         returnStdout: true
     ).trim()
@@ -336,15 +340,19 @@ pipeline {
                     STUBS_COMMIT = sh(script: 'cd integration-tests-stubs && git log --pretty=format:"%h | %an: %s" -n 1 2>/dev/null || echo "N/A"', returnStdout: true).trim()
 
                     FILE_NAME_PATTERN = "${JOB_NAME}_${BUILD_ID}_${BUILD_TAG}"
-                    TEST_OUTPUT = "${env.WORKSPACE}/fastlane/test_output"
+                    // Single source of truth: relative paths under workspace (used for TEST_OUTPUT and post/publish)
+                    TEST_OUTPUT_REL = 'fastlane/test_output'
+                    RERUN_TEST_OUTPUT_REL = 'fastlane/rerun_test_output'
+                    TEST_OUTPUT = "${env.WORKSPACE}/${TEST_OUTPUT_REL}"
 
                     // ── Validate inputs ──
                     echo "═══ Validating inputs ═══"
                     def validationErrors = []
 
-                    def schemeExists = sh(script: "xcodebuild -list -project Nordstrom.xcodeproj 2>/dev/null | grep -q '${params.SCHEME_NAME}' && echo 'yes' || echo 'no'", returnStdout: true).trim()
+                    // Exact scheme match (align with squad_specific_test_run.yml validation)
+                    def schemeExists = sh(script: "xcodebuild -list -project Nordstrom.xcodeproj 2>/dev/null | grep -E \"^\\\\s*${params.SCHEME_NAME}\\\\s*\\\$\" && echo 'yes' || echo 'no'", returnStdout: true).trim()
                     if (schemeExists == 'no') {
-                        validationErrors << "Scheme '${params.SCHEME_NAME}' not found"
+                        validationErrors << "Scheme '${params.SCHEME_NAME}' not found in project"
                     }
 
                     def deviceExists = sh(script: "xcrun simctl list devices 2>/dev/null | grep -q '${params.DEVICE_NAME}' && echo 'yes' || echo 'no'", returnStdout: true).trim()
@@ -375,7 +383,7 @@ pipeline {
                     def startMsg = """*Test Run Started*
 
 *Build:* <${env.BUILD_URL}|Jenkins #${BUILD_NUMBER}>
-*Branch:* `${BUILD_CURRENT_BRANCH ?: params.FLA_BRANCH}` | *Tag:* `${BUILD_TAG}`
+*Branch:* `${(BUILD_CURRENT_BRANCH && BUILD_CURRENT_BRANCH != 'HEAD') ? BUILD_CURRENT_BRANCH : params.FLA_BRANCH}` | *Tag:* `${BUILD_TAG}`
 *Scheme:* `${params.SCHEME_NAME}`
 
 *Config:* ${params.DEVICE_NAME} | iOS ${params.RUNTIME_VERSION} | ${params.WORKERS} workers
@@ -391,6 +399,8 @@ _Commits:_
 
         // ═══════════════════════════════════════════════════════════
         // STAGE 2: BUILD
+        // Same strategy as fla-ios .github/workflows/squad_specific_test_run.yml:
+        // prebuild once (buildspecs), then run tests using that build (derivedDataPath).
         // ═══════════════════════════════════════════════════════════
         stage('Build') {
             steps {
@@ -430,18 +440,45 @@ _Commits:_
                         fi
                     """
 
-                    // ── Build project ──
-                    echo "═══ Building project ═══"
+                    // ── Ensure fla-ios ACKNOWLEDGEMENTS.txt exists (Xcode copy phase requires it) ──
+                    sh """
+                        if [ ! -f fla-ios/ACKNOWLEDGEMENTS.txt ]; then
+                            mkdir -p fla-ios
+                            touch fla-ios/ACKNOWLEDGEMENTS.txt
+                            echo "Created placeholder fla-ios/ACKNOWLEDGEMENTS.txt (missing in tree)"
+                        fi
+                    """
+
+                    // ── Install gems (needed for stubs and report stages) ──
                     withCredentials([string(credentialsId: 'ARTIFACTORY_TOKEN', variable: 'ARTIFACTORY_TOKEN')]) {
                         sh """
                             bundle config set --local path '${BUNDLE_PATH}'
                             bundle config set --local jobs 4
                             bundle install
-
-                            export SPM_CACHE_DIR="${SPM_CACHE_DIR}"
-                            bundle exec rake "buildspecs[${params.SCHEME_NAME}]"
                         """
                     }
+
+                    // ── Build for testing (direct xcodebuild: avoids Rakefile treating warnings as failure) ──
+                    echo "═══ Building for testing ═══"
+                    sh """
+                        set -o pipefail
+                        export SPM_CACHE_DIR="${SPM_CACHE_DIR}"
+                        export MODULE_CACHE_DIR="${env.WORKSPACE}/Build/DerivedData/ModuleCache"
+                        export SYMROOT="${env.WORKSPACE}/Build/DerivedData/Products"
+
+                        mkdir -p Build/DerivedData
+                        xcodebuild build-for-testing \\
+                            -project Nordstrom.xcodeproj \\
+                            -configuration AdHoc \\
+                            -sdk iphonesimulator \\
+                            -scheme "${params.SCHEME_NAME}" \\
+                            -destination 'generic/platform=iOS Simulator,OS=${params.RUNTIME_VERSION}' \\
+                            -derivedDataPath "${env.WORKSPACE}/Build/DerivedData" \\
+                            -onlyUsePackageVersionsFromResolvedFile \\
+                            -skipPackagePluginValidation \\
+                            2>&1 | tee "Build/build-${params.SCHEME_NAME}.log" \\
+                            | Build/bin/xcbeautify --quieter --disable-logging
+                    """
 
                     // ── Generate stubs ──
                     echo "═══ Generating stubs ═══"
@@ -469,10 +506,9 @@ _Commits:_
                         echo "Resolving specific test methods: ${params.TEST_METHODS}"
                         testMethods = sh(
                             script: """
-                                bundle exec ruby -r ./ruby/project/test.rb -e "
-                                    targets = '${params.TEST_METHODS}'.split(',').map(&:strip)
-                                    puts Project::Test.find_swift_tests(targets, '${params.SCHEME_NAME}')
-                                " 2>/dev/null || echo ""
+                                export TEST_METHODS_LIST="${params.TEST_METHODS.replaceAll('\\\\', '\\\\\\\\').replaceAll('"', '\\\\"')}"
+                                export SCHEME_FOR_TESTS="${params.SCHEME_NAME}"
+                                bundle exec ruby -r ./ruby/project/test.rb -e 'targets = (ENV[\"TEST_METHODS_LIST\"] || \"\").to_s.split(\",\").map(&:strip); puts Project::Test.find_swift_tests(targets, ENV[\"SCHEME_FOR_TESTS\"])' 2>/dev/null || echo ""
                             """,
                             returnStdout: true
                         ).trim()
@@ -489,6 +525,7 @@ _Commits:_
                         workers: params.WORKERS,
                         outputDir: TEST_OUTPUT,
                         resultName: FILE_NAME_PATTERN,
+                        derivedDataPath: "${env.WORKSPACE}/Build/DerivedData",
                         disableParallel: (params.SCHEME_NAME == 'XCUITests-P0'),
                         enableShipped: params.ENABLE_SHIPPED_FEATURE_FLAGS,
                         testMethods: testMethods
@@ -531,7 +568,7 @@ _Commits:_
                                 "${firstRunJunit}" "${params.SCHEME_NAME}" "${params.DEVICE_NAME}" \
                                 "${params.RUNTIME_VERSION}" "${TEST_OUTPUT}/DerivedData/SourcePackages" || true
                         """
-                        RERUN_TEST_OUTPUT = "${env.WORKSPACE}/fastlane/rerun_test_output"
+                        RERUN_TEST_OUTPUT = "${env.WORKSPACE}/${RERUN_TEST_OUTPUT_REL}"
                         return
                     }
 
@@ -540,7 +577,7 @@ _Commits:_
                     // ── Clean simulators and rerun ──
                     sh "xcrun simctl erase all || true"
 
-                    RERUN_TEST_OUTPUT = "${env.WORKSPACE}/fastlane/rerun_test_output"
+                    RERUN_TEST_OUTPUT = "${env.WORKSPACE}/${RERUN_TEST_OUTPUT_REL}"
                     sh "mkdir -p ${RERUN_TEST_OUTPUT}"
 
                     runXCUITests(
@@ -550,6 +587,7 @@ _Commits:_
                         workers: '1',
                         outputDir: RERUN_TEST_OUTPUT,
                         resultName: "${FILE_NAME_PATTERN}_rerun",
+                        derivedDataPath: "${env.WORKSPACE}/Build/DerivedData",
                         disableParallel: true,
                         enableShipped: params.ENABLE_SHIPPED_FEATURE_FLAGS,
                         testMethods: failedTests
@@ -564,6 +602,9 @@ _Commits:_
         stage('Report') {
             steps {
                 script {
+                    // Clean simulators after test run (align with squad_specific_test_run.yml)
+                    sh "bundle exec rake cleansimulators 2>/dev/null || true"
+
                     def durationSec = ((System.currentTimeMillis() - STARTTIME) / 1000).intValue()
                     def duration = formatDuration(durationSec)
 
@@ -661,18 +702,18 @@ _Commits:_
                 includeProperties: false,
                 jdk: '',
                 reportBuildPolicy: 'ALWAYS',
-                results: [[path: 'fastlane/test_output/allure-results']]
+                results: [[path: "${TEST_OUTPUT_REL}/allure-results"]]
             ])
 
             junit(
-                testResults: 'fastlane/test_output/report.xml',
+                testResults: "${TEST_OUTPUT_REL}/report.xml",
                 allowEmptyResults: true,
                 skipPublishingChecks: false,
                 skipMarkingBuildUnstable: true
             )
 
             junit(
-                testResults: 'fastlane/rerun_test_output/report.xml',
+                testResults: "${RERUN_TEST_OUTPUT_REL}/report.xml",
                 allowEmptyResults: true,
                 skipPublishingChecks: false,
                 skipMarkingBuildUnstable: true
@@ -682,13 +723,13 @@ _Commits:_
                 allowMissing: true,
                 alwaysLinkToLastBuild: true,
                 keepAll: true,
-                reportDir: 'fastlane/test_output',
+                reportDir: TEST_OUTPUT_REL,
                 reportFiles: 'report.xml',
                 reportName: 'Test Results'
             ])
 
             archiveArtifacts(
-                artifacts: 'fastlane/**/report.xml, fastlane/**/failed_tests*.csv, Build/specs-*.log',
+                artifacts: "${TEST_OUTPUT_REL}/report.xml, ${TEST_OUTPUT_REL}/failed_tests*.csv, ${RERUN_TEST_OUTPUT_REL}/report.xml, ${RERUN_TEST_OUTPUT_REL}/failed_tests*.csv, Build/specs-*.log",
                 allowEmptyArchive: true,
                 fingerprint: true
             )
