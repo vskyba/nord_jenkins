@@ -418,6 +418,18 @@ _Commits:_
                         echo "Using: \$(xcode-select -p)"
                     """
 
+                    // ── Use agent's xcbeautify (Rakefile expects Build/bin/xcbeautify) ──
+                    sh """
+                        mkdir -p Build/bin
+                        if [ ! -x Build/bin/xcbeautify ] && command -v xcbeautify >/dev/null 2>&1; then
+                            ln -sf "\$(command -v xcbeautify)" Build/bin/xcbeautify
+                        fi
+                        if [ ! -x Build/bin/xcbeautify ]; then
+                            echo "ERROR: Build/bin/xcbeautify not found. Install on the agent (e.g. brew install xcbeautify) and ensure it is on PATH."
+                            exit 1
+                        fi
+                    """
+
                     // ── Build project ──
                     echo "═══ Building project ═══"
                     withCredentials([string(credentialsId: 'ARTIFACTORY_TOKEN', variable: 'ARTIFACTORY_TOKEN')]) {
@@ -516,8 +528,8 @@ _Commits:_
                         sh """
                             xcrun simctl erase all || true
                             BUILD_ID=dontKillMe ~/scripts/rerunTests_xml.py \
-                                ${firstRunJunit} "${params.SCHEME_NAME}" "${params.DEVICE_NAME}" \
-                                "${params.RUNTIME_VERSION}" ${TEST_OUTPUT}/DerivedData/SourcePackages || true
+                                "${firstRunJunit}" "${params.SCHEME_NAME}" "${params.DEVICE_NAME}" \
+                                "${params.RUNTIME_VERSION}" "${TEST_OUTPUT}/DerivedData/SourcePackages" || true
                         """
                         RERUN_TEST_OUTPUT = "${env.WORKSPACE}/fastlane/rerun_test_output"
                         return
@@ -600,7 +612,7 @@ _Commits:_
                             echo "═══ Generating rerun reports ═══"
 
                             def rerunJunit = "${RERUN_TEST_OUTPUT}/report.xml"
-                            sh "ls ${RERUN_TEST_OUTPUT}/*.xcresult 2>/dev/null && ./Build/bin/xcresultparser -o junit ${RERUN_TEST_OUTPUT}/*.xcresult > ${rerunJunit} || true"
+                            sh "f=\$(find \"${RERUN_TEST_OUTPUT}\" -maxdepth 1 -name '*.xcresult' 2>/dev/null | head -1); [ -n \"\$f\" ] && ./Build/bin/xcresultparser -o junit \"\$f\" > ${rerunJunit} || true"
 
                             if (fileExists(rerunJunit)) {
                                 generateFailedTestsCsv(rerunJunit, "${RERUN_TEST_OUTPUT}/failed_tests_rerun.csv")
