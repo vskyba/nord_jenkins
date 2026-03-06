@@ -1,9 +1,10 @@
 /* groovylint-disable GStringExpressionWithinString, LineLength */
 import groovy.json.JsonSlurper
 
-// ─────────────────────────────────────────────────────────────
-// ── Global Variable Declarations ────────────────────────────
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// ═  GLOBAL STATE
+// ═  Slack thread, timestamps, test counts, device/runtime from SIMULATOR_DEVICE
+// ═══════════════════════════════════════════════════════════════════════════
 
 def SLACK_CURRENT_THREAD = ''
 def JOB_START_TIMESTAMP = ''
@@ -12,14 +13,14 @@ def RERUN_SKIPPED = true
 def RERUN_TEST_OUTPUT = ''
 def STARTTIME = 0
 def RERUN_STARTTIME = 0
-// Parsed from SIMULATOR_DEVICE (device|runtime|optionalId)
 def DEVICE_NAME = ''
 def RUNTIME_VERSION = ''
 def SIMULATOR_ID = ''
 
-// ─────────────────────────────────────────────────────────────
-// ── HELPER METHODS ──────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// ═  HELPERS
+// ═  Slack API, test counters, duration formatting, xcodebuild test runner
+// ═══════════════════════════════════════════════════════════════════════════
 
 def slackPostInitialMessage(String text, String channel) {
     int maxAttempts = 3
@@ -141,17 +142,14 @@ def uploadFileToSlack(String filePath, String text, String channel, String threa
 }
 
 /**
- * Reads test counts from JUnit XML (fla-ios Reports.summary_counts).
- * Returns [failed:, executed:, disabled:] as strings; uses 'null' when file missing or parse fails.
- * Ruby -e is single-quoted with path in JUNIT_PATH to avoid zsh glob on [...].
+ * Reads JUnit summary counts (failed, executed, disabled) from fla-ios Reports.
  */
 def readTestCountersFromJunit(String junitPath) {
     def counters = [failed: 'null', executed: 'null', disabled: 'null']
     if (!fileExists(junitPath)) {
         return counters
     }
-
-    // Call fla-ios Ruby: path via env so -e can be single-quoted (avoids zsh glob on counts[:failed])
+    // Path via env so Ruby -e stays single-quoted (avoids zsh glob)
     def result = sh(
         script: """
             export JUNIT_PATH="${junitPath}"
@@ -208,7 +206,7 @@ def runXCUITests(Map config) {
         "-parallel-testing-enabled YES -parallel-testing-worker-count ${config.workers}"
 
     def testMethodsArg = config.testMethods ?: ''
-    // Reuse Build stage DerivedData (prebuild-once strategy, same as squad_specific_test_run.yml)
+    // Reuse Build DerivedData (prebuild-once; same as fla-ios squad_specific_test_run)
     def derivedDataPath = config.derivedDataPath ?: "${config.outputDir}/DerivedData"
     def destination = (config.simulatorId ?: '').trim() ?
         "id=${config.simulatorId}" :
@@ -240,8 +238,7 @@ def runXCUITests(Map config) {
     )
 
     echo "xcodebuild test finished (exit code: ${exitCode})"
-
-    // Exit code 0 = success, 65 = test failures (acceptable), others = infrastructure failure
+    // Exit: 0 = success, 65 = test failures (ok), other = infrastructure failure
     if (exitCode != 0 && exitCode != 65) {
         error "Build/infrastructure failure (exit code ${exitCode})"
     }
@@ -256,7 +253,7 @@ def generateJunitReport(String xcresultPath, String outputPath) {
     """
 
     if (fileExists(outputPath)) {
-        // Fix failure messages (path via env to avoid zsh glob in -e)
+        // Normalize failure messages; path via env for safe Ruby -e
         sh """
             export JUNIT_FIX_PATH="${outputPath}"
             bundle exec ruby -r ./ruby/project/test.rb -e 'Project::Test.fix_junit_failure_messages(ENV[\"JUNIT_FIX_PATH\"])' 2>/dev/null || true
@@ -283,9 +280,10 @@ def extractFailedTestMethods(String junitPath, String scheme) {
     ).trim()
 }
 
-// ─────────────────────────────────────────────────────────────
-// ── PIPELINE ────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// ═  PIPELINE
+// ═  Setup → Build → Test → Rerun (optional) → Report → Post
+// ═══════════════════════════════════════════════════════════════════════════
 
 pipeline {
     agent any
@@ -299,10 +297,7 @@ pipeline {
     }
 
     environment {
-        // Credentials - available throughout pipeline
         SLACK_TOKEN = credentials('SLACK_TOKEN')
-
-        // Cache directories
         COCOAPODS_CACHE = "${env.HOME}/.cocoapods"
         BUNDLE_PATH = "${env.WORKSPACE}/vendor/bundle"
         SPM_CACHE_DIR = "${env.WORKSPACE}/spm_cache"
@@ -391,9 +386,11 @@ pipeline {
     }
 
     stages {
-        // ═══════════════════════════════════════════════════════════
-        // STAGE 1: SETUP
-        // ═══════════════════════════════════════════════════════════
+
+        // ┌─────────────────────────────────────────────────────────────────────┐
+        // │  STAGE 1: SETUP                                                      │
+        // │  Checkout fla-ios + integration-tests-stubs · validate · caches · Slack
+        // └─────────────────────────────────────────────────────────────────────┘
         stage('Setup') {
             steps {
                 script {
@@ -405,7 +402,6 @@ pipeline {
                     }
                     JOB_START_TIMESTAMP = sh(script: "date +%s", returnStdout: true).trim()
 
-                    // ── Checkout repositories ──
                     echo "[Setup] Checking out repositories..."
                     checkout([
                         $class: 'GitSCM',
@@ -427,7 +423,6 @@ pipeline {
                         ])
                     }
 
-                    // ── Collect build info ──
                     echo "[Setup] Collecting build information..."
                     NOW = sh(script: "date +'%d/%m/%Y %r'", returnStdout: true).trim()
                     BUILD_TAG = sh(script: 'git describe --tags "$(git rev-list --tags --max-count=1)" 2>/dev/null || echo "untagged-$(git rev-parse --short HEAD)"', returnStdout: true).trim()
@@ -436,16 +431,13 @@ pipeline {
                     STUBS_COMMIT = sh(script: 'cd integration-tests-stubs && git log --pretty=format:"%h | %an: %s" -n 1 2>/dev/null || echo "N/A"', returnStdout: true).trim()
 
                     FILE_NAME_PATTERN = "${JOB_NAME}_${BUILD_ID}_${BUILD_TAG}"
-                    // Single source of truth: relative paths under workspace (used for TEST_OUTPUT and post/publish)
                     TEST_OUTPUT_REL = 'fastlane/test_output'
                     RERUN_TEST_OUTPUT_REL = 'fastlane/rerun_test_output'
                     TEST_OUTPUT = "${env.WORKSPACE}/${TEST_OUTPUT_REL}"
 
-                    // ── Validate inputs ──
                     echo "[Setup] Validating inputs..."
                     def validationErrors = []
 
-                    // Exact scheme match (align with squad_specific_test_run.yml validation)
                     def schemeExists = sh(script: "xcodebuild -list -project Nordstrom.xcodeproj 2>/dev/null | grep -E \"^\\\\s*${params.SCHEME_NAME}\\\\s*\\\$\" && echo 'yes' || echo 'no'", returnStdout: true).trim()
                     if (schemeExists == 'no') {
                         validationErrors << "Scheme '${params.SCHEME_NAME}' not found in project"
@@ -465,7 +457,6 @@ pipeline {
                         validationErrors.each { echo "WARNING: ${it}" }
                     }
 
-                    // ── Setup caches ──
                     echo "[Setup] Setting up caches..."
                     sh """
                         mkdir -p "${COCOAPODS_CACHE}" "${BUNDLE_PATH}" "${SPM_CACHE_DIR}" || true
@@ -474,7 +465,6 @@ pipeline {
                         du -sh "${BUNDLE_PATH}" 2>/dev/null || echo "  Bundle: empty"
                     """
 
-                    // ── Send Slack notification ──
                     echo "[Setup] Sending start notification to Slack..."
                     def startMsg = """*Test Run Started*
 
@@ -493,15 +483,14 @@ _Commits:_
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // STAGE 2: BUILD
-        // Same strategy as fla-ios .github/workflows/squad_specific_test_run.yml:
-        // prebuild once (buildspecs), then run tests using that build (derivedDataPath).
-        // ═══════════════════════════════════════════════════════════
+        // ┌─────────────────────────────────────────────────────────────────────┐
+        // │  STAGE 2: BUILD                                                     │
+        // │  Clean env · xcbeautify · ACKNOWLEDGEMENTS · prebuild · build-for-testing · stubs
+        // │  (Same flow as fla-ios squad_specific_test_run; direct xcodebuild to avoid warning-as-failure)
+        // └─────────────────────────────────────────────────────────────────────┘
         stage('Build') {
             steps {
                 script {
-                    // ── Environment cleanup ──
                     echo "[Build] Cleaning environment..."
                     sh """
                         rake clean || true
@@ -524,7 +513,7 @@ _Commits:_
                         echo "Using: \$(xcode-select -p)"
                     """
 
-                    // ── Use agent's xcbeautify (Rakefile expects Build/bin/xcbeautify) ──
+                    // ──  Rakefile expects Build/bin/xcbeautify  ─────────────────────────────
                     sh """
                         mkdir -p Build/bin
                         if [ ! -x Build/bin/xcbeautify ] && command -v xcbeautify >/dev/null 2>&1; then
@@ -536,7 +525,7 @@ _Commits:_
                         fi
                     """
 
-                    // ── Ensure fla-ios ACKNOWLEDGEMENTS.txt exists (Xcode copy phase requires it) ──
+                    // ──  Xcode copy phase requires fla-ios/ACKNOWLEDGEMENTS.txt  ──────────────
                     sh """
                         if [ ! -f fla-ios/ACKNOWLEDGEMENTS.txt ]; then
                             mkdir -p fla-ios
@@ -545,20 +534,19 @@ _Commits:_
                         fi
                     """
 
-                    // ── Install gems (needed for stubs and report stages) ──
+                    // ──  Prebuild (bundle install + rake prebuild) then build-for-testing  ──
                     withCredentials([string(credentialsId: 'ARTIFACTORY_TOKEN', variable: 'ARTIFACTORY_TOKEN')]) {
-                        sh """
-                            bundle config set --local path '${BUNDLE_PATH}'
-                            bundle config set --local jobs 4
-                            bundle install
-                        """
+                        withEnv(['CI=', "ARTIFACTORY_TOKEN=${env.ARTIFACTORY_TOKEN}"]) {
+                            sh """
+                                bundle config set --local path '${BUNDLE_PATH}'
+                                bundle config set --local jobs 4
+                                bundle install
+
+                                echo "[Build] Regenerating Xcode project..."
+                                bundle exec rake prebuild
+                            """
+                        }
                     }
-
-                    // ── Regenerate Xcode project (removes stale file references after deletions) ──
-                    echo "[Build] Regenerating Xcode project..."
-                    sh "bundle exec rake prebuild"
-
-                    // ── Build for testing (direct xcodebuild: avoids Rakefile treating warnings as failure) ──
                     echo "[Build] Building for testing (full log: Build/build-${params.SCHEME_NAME}.log)"
                     sh """
                         set -o pipefail
@@ -581,7 +569,7 @@ _Commits:_
                     """
                     echo "[Build] Finished."
 
-                    // ── Generate stubs ──
+                    // ──  Generate stubs (LocalStubServer-cli)  ─────────────────────────────────
                     echo "[Build] Generating stubs..."
                     sh """
                         /usr/bin/xcrun --sdk macosx swift run --package-path ./scripts/LocalStubServer-cli \
@@ -593,15 +581,15 @@ _Commits:_
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // STAGE 3: TEST
-        // ═══════════════════════════════════════════════════════════
+        // ┌─────────────────────────────────────────────────────────────────────┐
+        // │  STAGE 3: TEST                                                      │
+        // │  Resolve test methods (if any) · run xcodebuild test · reuse DerivedData
+        // └─────────────────────────────────────────────────────────────────────┘
         stage('Test') {
             steps {
                 script {
                     STARTTIME = System.currentTimeMillis()
 
-                    // ── Resolve test methods if specified ──
                     def testMethods = ''
                     if (params.TEST_METHODS?.trim()) {
                         echo "Resolving specific test methods: ${params.TEST_METHODS}"
@@ -615,7 +603,6 @@ _Commits:_
                         ).trim()
                     }
 
-                    // ── Run tests ──
                     echo "[Test] Running tests (full log: ${TEST_OUTPUT}/test-run.log)"
                     sh "mkdir -p ${TEST_OUTPUT}"
 
@@ -636,14 +623,14 @@ _Commits:_
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // STAGE 4: RERUN (conditional)
-        // ═══════════════════════════════════════════════════════════
+        // ┌─────────────────────────────────────────────────────────────────────┐
+        // │  STAGE 4: RERUN FAILED (optional)                                   │
+        // │  JUnit from 1st run · extract failed tests · rerun with single worker
+        // └─────────────────────────────────────────────────────────────────────┘
         stage('Rerun Failed') {
             when { expression { return params.RERUN_ENABLED } }
             steps {
                 script {
-                    // ── Generate 1st run report to check for failures ──
                     def firstRunJunit = "${TEST_OUTPUT}/report.xml"
                     generateJunitReport("${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult", firstRunJunit)
 
@@ -659,7 +646,6 @@ _Commits:_
                     RERUN_SKIPPED = false
                     RERUN_STARTTIME = System.currentTimeMillis()
 
-                    // ── Extract failed tests ──
                     def failedTests = extractFailedTestMethods(firstRunJunit, params.SCHEME_NAME)
 
                     if (!failedTests?.trim()) {
@@ -675,8 +661,6 @@ _Commits:_
                     }
 
                     echo "Rerunning ${FAILED_COUNT_1ST} failed test(s)"
-
-                    // ── Clean simulators and rerun ──
                     sh "xcrun simctl erase all || true"
 
                     RERUN_TEST_OUTPUT = "${env.WORKSPACE}/${RERUN_TEST_OUTPUT_REL}"
@@ -699,19 +683,18 @@ _Commits:_
             }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // STAGE 5: REPORT
-        // ═══════════════════════════════════════════════════════════
+        // ┌─────────────────────────────────────────────────────────────────────┐
+        // │  STAGE 5: REPORT                                                    │
+        // │  Cleansimulators · JUnit/Allure/CSV · Slack 1st run · rerun reports
+        // └─────────────────────────────────────────────────────────────────────┘
         stage('Report') {
             steps {
                 script {
-                    // Clean simulators after test run (align with squad_specific_test_run.yml)
                     sh "bundle exec rake cleansimulators 2>/dev/null || true"
 
                     def durationSec = ((System.currentTimeMillis() - STARTTIME) / 1000).intValue()
                     def duration = formatDuration(durationSec)
 
-                    // ── Generate 1st run reports ──
                     echo "[Report] Generating reports (JUnit, Allure, CSV)..."
                     def firstRunJunit = "${TEST_OUTPUT}/report.xml"
 
@@ -719,11 +702,7 @@ _Commits:_
                         generateJunitReport("${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult", firstRunJunit)
                     }
                     generateFailedTestsCsv(firstRunJunit, "${TEST_OUTPUT}/failed_tests.csv")
-
-                    // Generate Allure report
                     sh "~/scripts/xcresults export ${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult ${TEST_OUTPUT}/allure-results 2>/dev/null || true"
-
-                    // Archive reports
                     sh "mkdir -p ~/JenkinsTestResults/${JOB_NAME} && cp ${firstRunJunit} ~/JenkinsTestResults/${JOB_NAME}/${BUILD_ID}.xml || true"
 
                     def counters = readTestCountersFromJunit(firstRunJunit)
@@ -731,8 +710,6 @@ _Commits:_
                         FAILED_COUNT_1ST = counters.failed
                     }
 
-                    // ── Send 1st run Slack notification ──
-                    // Note: If a prior stage (e.g. Rerun) fails, Report is skipped and this message is never sent.
                     echo "[Report] Sending 1st run results to Slack..."
                     def slackMsg = buildSlackMessage(
                         FAILED_COUNT_1ST == '0',
@@ -749,7 +726,6 @@ _Commits:_
                         slackPostMessage(slackMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD)
                     }
 
-                    // ── Generate rerun reports if applicable ──
                     if (params.RERUN_ENABLED) {
                         if (RERUN_SKIPPED) {
                             slackPostMessage("_Rerun skipped - no failures in 1st run_", params.REPORT_CHANNEL, SLACK_CURRENT_THREAD)
@@ -788,20 +764,19 @@ _Commits:_
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // POST ACTIONS
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ═  POST
+    // ═  Cleanup · Allure · JUnit · HTML report · archive artifacts · UNSTABLE→SUCCESS
+    // ═══════════════════════════════════════════════════════════════════════════
     post {
         always {
             script {
-                // ── Cleanup ──
                 sh """
                     killall Simulator Xcode 'Problem Reporter' 2>/dev/null || true
                     echo "Job duration: \$(( (\$(date +%s) - ${JOB_START_TIMESTAMP}) / 60 )) minutes"
                 """
             }
 
-            // ── Publish reports ──
             allure([
                 includeProperties: false,
                 jdk: '',
@@ -839,7 +814,7 @@ _Commits:_
             )
 
             script {
-                // Mark unstable builds as success (test failures don't fail the build)
+                // Test failures mark build UNSTABLE; we treat as SUCCESS so job does not fail
                 if (currentBuild.result == null || currentBuild.result == 'UNSTABLE') {
                     currentBuild.result = 'SUCCESS'
                 }
