@@ -407,7 +407,7 @@ pipeline {
                 script {
                     echo """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  STAGE 1: SETUP                                                         ║
+║  STAGE 1: SETUP                                                          ║
 ║  Checkout fla-ios + integration-tests-stubs · validate · caches · Slack  ║
 ╚══════════════════════════════════════════════════════════════════════════╝"""
                     def parts = params.SIMULATOR_DEVICE.split('\\|')
@@ -618,7 +618,7 @@ _Commits:_
                 script {
                     echo """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  STAGE 3: TEST                                                          ║
+║  STAGE 3: TEST                                                           ║
 ║  Resolve test methods (if any) · run xcodebuild test · reuse DerivedData ║
 ╚══════════════════════════════════════════════════════════════════════════╝"""
                     STARTTIME = System.currentTimeMillis()
@@ -736,7 +736,7 @@ _Commits:_
                     echo """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║  STAGE 5: REPORT                                                         ║
-║  Cleansimulators · JUnit/Allure/CSV · Slack 1st run · rerun reports       ║
+║  Cleansimulators · JUnit/Allure/CSV · Slack 1st run · rerun reports      ║
 ╚══════════════════════════════════════════════════════════════════════════╝"""
                     sh "bundle exec rake cleansimulators 2>/dev/null || true"
 
