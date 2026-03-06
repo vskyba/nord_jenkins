@@ -192,13 +192,16 @@ def formatDuration(long durationSec) {
 }
 
 def buildSlackMessage(boolean isSuccess, String jobName, String now, String duration,
-                      String workers, String failed, String executed, String disabled) {
+                      String workers, String failed, String executed, String disabled,
+                      List<String> extraLines = []) {
     def status = isSuccess ? "Completed Successfully" : "Completed with Failures"
-    def buildUrl = (env.BUILD_URL ?: '').replace('localhost', 'skynet-studio.org')
+    def rawUrl = env.BUILD_URL ?: ''
+    def buildUrl = rawUrl.replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
     def buildLink = buildUrl ? "\n*Build:* <${buildUrl}|#${BUILD_NUMBER}>" : ""
-    def allureLink = (isSuccess || !buildUrl) ? "" : "\n*Allure Report:* <${buildUrl}allure/|LINK>"
+    def allureReportUrl = buildUrl ? (buildUrl.endsWith('/') ? "${buildUrl}allure/" : "${buildUrl}/allure/") : ''
+    def allureLink = (isSuccess || !allureReportUrl) ? "" : "\n*Allure Report:* <${allureReportUrl}|LINK>"
 
-    return """*Test Run ${status}!*${buildLink}${allureLink}
+    def body = """*Test Run ${status}!*${buildLink}${allureLink}
 
 *Job Name:* `${jobName}`
 *Start Time:* `${now}`
@@ -207,6 +210,10 @@ def buildSlackMessage(boolean isSuccess, String jobName, String now, String dura
 *Test Summary:*
 - *Workers:* `${workers}`
 - *Executed:* `${executed}` | *Failed:* `${failed}` | *Disabled:* `${disabled}`"""
+    if (extraLines) {
+        body += "\n\n" + extraLines.findAll { it?.trim() }.join("\n")
+    }
+    return body
 }
 
 def runXCUITests(Map config) {
@@ -289,6 +296,174 @@ def extractFailedTestMethods(String junitPath, String scheme) {
         """,
         returnStdout: true
     ).trim()
+}
+
+/** Returns [flakyCount, realCount, flakyNote, flakyTestNames] by comparing 1st run vs rerun failed tests. flakyTestNames = test name part (after last /) for CSV Flaky column. */
+def computeFlakyAndReal(String firstRunJunit, String rerunJunit, String scheme) {
+    def firstFailed = extractFailedTestMethods(firstRunJunit, scheme).split(/\s+/).findAll { it?.trim() }.toSet()
+    def rerunFailed = extractFailedTestMethods(rerunJunit, scheme).split(/\s+/).findAll { it?.trim() }.toSet()
+    def flaky = firstFailed - rerunFailed
+    def real = rerunFailed
+    def flakyNote = (flaky.size() > 0 || real.size() > 0) ? "Flaky: ${flaky.size()} | Real failures: ${real.size()}" : ''
+    // Extract test name (e.g. testFoo()) from "-only-testing:bundle/Class/testFoo()" for fla-ios CSV
+    def flakyTestNames = flaky.collect { it.split('/').last()?.trim() ?: '' }.findAll { it }
+    return [flakyCount: flaky.size(), realCount: real.size(), flakyNote: flakyNote, flakyTestNames: flakyTestNames]
+}
+
+/** Returns a short root-cause hint string from JUnit failure/error messages (keyword clustering). */
+def getFailureHints(String junitPath) {
+    if (!fileExists(junitPath)) return ''
+    try {
+        def xml = readFile(junitPath)
+        def matcher = (xml =~ /<(?:failure|error)[^>]*message="([^"]*)"[^>]*>/)
+        def messages = []
+        while (matcher.find()) { messages << matcher.group(1) }
+        if (messages.isEmpty()) {
+            matcher = (xml =~ /<(?:failure|error)[^>]*>([^<]+)/)
+            while (matcher.find()) { messages << matcher.group(1) }
+        }
+        if (messages.isEmpty()) return ''
+        def keywords = [
+            'timeout': 0, 'timed out': 0, 'wait': 0,
+            'element': 0, 'not found': 0, 'located': 0,
+            'assertion': 0, 'assert': 0, 'expected': 0,
+            'nil': 0, 'null': 0, 'optional': 0,
+            'crash': 0, 'fatal': 0, 'exception': 0,
+            'network': 0, 'connection': 0, 'url': 0
+        ]
+        def lower = messages.collect { it?.toLowerCase() ?: '' }
+        keywords.keySet().each { k ->
+            keywords[k] = lower.count { it.contains(k) }
+        }
+        def buckets = keywords.findAll { it.value > 0 }.sort { -it.value }.take(3)
+        if (buckets.isEmpty()) return ''
+        return "Hints: " + buckets.collect { "${it.key} (${it.value})" }.join(', ')
+    } catch (Exception e) {
+        echo "Failure hints parse error: ${e.message}"
+        return ''
+    }
+}
+
+/** Writes run_summary.json (run-level metrics + flaky/hints/anomaly) for archiving and dashboards. */
+def writeRunSummary(String outputDir, Map summary) {
+    def path = "${outputDir}/run_summary.json"
+    writeFile file: path, text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(summary))
+    echo "Written ${path}"
+}
+
+/** Escapes string for safe use in HTML. */
+def escapeHtml(String s) {
+    if (s == null) return ''
+    return s.toString()
+        .replace('&', '&amp;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+        .replace('"', '&quot;')
+}
+
+/** Generates run_summary.html for visualising run summary (open from Jenkins artifacts or Run Summary report). */
+def writeRunSummaryHtml(Map summary, String outputDir) {
+    def json = groovy.json.JsonOutput.toJson(summary)
+    def jsonEscaped = json.replace('\\', '\\\\').replace('</', '<\\/').replace('<!--', '<\\!--')
+    def hintsEscaped = escapeHtml(summary.failure_hints as String)
+    def anomalyEscaped = escapeHtml(summary.anomaly as String)
+    def flakyListHtml = (summary.flaky_tests && summary.flaky_tests.size() > 0)
+        ? summary.flaky_tests.collect { escapeHtml(it as String) }.join('\n')
+        : ''
+    def html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Run Summary · ${summary.job_name} #${summary.build_id}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 1rem; background: #f5f5f5; }
+    h1 { font-size: 1.25rem; margin: 0 0 1rem 0; color: #333; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 1rem; margin-bottom: 1rem; }
+    .card h2 { font-size: 0.875rem; margin: 0 0 0.5rem 0; color: #666; text-transform: uppercase; letter-spacing: 0.05em; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0.75rem; }
+    .metric { background: #f8f9fa; padding: 0.5rem 0.75rem; border-radius: 6px; }
+    .metric .value { font-weight: 600; font-size: 1.1rem; }
+    .metric .label { font-size: 0.75rem; color: #666; }
+    .insight { padding: 0.5rem 0; border-bottom: 1px solid #eee; }
+    .insight:last-child { border-bottom: none; }
+    .anomaly { background: #fff3cd; border-left: 4px solid #ffc107; padding: 0.5rem 0.75rem; border-radius: 0 6px 6px 0; }
+    .flaky-list { font-family: monospace; font-size: 0.8rem; max-height: 200px; overflow-y: auto; }
+    .muted { color: #999; font-size: 0.875rem; }
+  </style>
+</head>
+<body>
+  <h1>Run Summary · ${summary.job_name} #${summary.build_id}</h1>
+  <div class="card">
+    <h2>Run info</h2>
+    <div class="grid">
+      <div class="metric"><span class="label">Scheme</span><div class="value">${summary.scheme ?: '-'}</div></div>
+      <div class="metric"><span class="label">Timestamp</span><div class="value muted">${summary.timestamp_iso ?: '-'}</div></div>
+      <div class="metric"><span class="label">Rerun</span><div class="value">${summary.has_rerun ? 'Yes' : 'No'}</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Metrics</h2>
+    <div class="grid">
+      <div class="metric"><span class="label">Duration</span><div class="value">${summary.duration_sec ?: 0}s</div></div>
+      <div class="metric"><span class="label">Executed</span><div class="value">${summary.executed ?: '0'}</div></div>
+      <div class="metric"><span class="label">Failed</span><div class="value">${summary.failed ?: '0'}</div></div>
+      <div class="metric"><span class="label">Disabled</span><div class="value">${summary.disabled ?: '0'}</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Insights</h2>
+    <div class="insight"><span class="label">Flaky / Real</span> ${summary.flaky_count ?: 0} flaky, ${summary.real_count ?: 0} real</div>
+    ${hintsEscaped ? "<div class=\"insight\"><span class=\"label\">Hints</span> ${hintsEscaped}</div>" : ''}
+    ${anomalyEscaped ? "<div class=\"insight anomaly\"><span class=\"label\">Anomaly</span> ${anomalyEscaped}</div>" : ''}
+    ${flakyListHtml ? "<div class=\"insight\"><span class=\"label\">Flaky tests</span><pre class=\"flaky-list\">" + flakyListHtml + "</pre></div>" : ''}
+  </div>
+  <div class="card muted">
+    <small>Generated from run_summary.json. Raw: <a href="run_summary.json">run_summary.json</a></small>
+  </div>
+  <script type="application/json" id="run-summary-data">${jsonEscaped}</script>
+</body>
+</html>"""
+    writeFile file: "${outputDir}/run_summary.html", text: html
+    echo "Written ${outputDir}/run_summary.html"
+}
+
+/** Checks duration/fail count vs recent baseline; returns anomaly message or ''. Baseline in ~/JenkinsTestResults/JOB_NAME/baseline.json. */
+def checkAnomaly(long durationSec, String failedCountStr, String executedCountStr, String jobName) {
+    def failedCount = (failedCountStr != null && failedCountStr != 'null') ? failedCountStr.toInteger() : 0
+    def baselineDir = "${env.HOME}/JenkinsTestResults/${jobName}"
+    def baselineFile = "${baselineDir}/baseline.json"
+    def keep = 30
+    def entries = []
+    try {
+        def raw = sh(script: "cat '${baselineFile}' 2>/dev/null || echo '[]'", returnStdout: true).trim()
+        def slurper = new groovy.json.JsonSlurper()
+        entries = slurper.parseText(raw) as List
+        if (entries == null) entries = []
+    } catch (Exception e) {
+        echo "Baseline read skipped: ${e.message}"
+    }
+    entries << [d: durationSec, f: failedCount]
+    if (entries.size() > keep) entries = entries[-keep..-1]
+    def json = groovy.json.JsonOutput.toJson(entries)
+    def tmpFile = "${env.WORKSPACE}/.baseline_tmp.json"
+    writeFile file: tmpFile, text: json
+    sh "mkdir -p '${baselineDir}' && cp '${tmpFile}' '${baselineFile}'"
+    if (entries.size() < 5) return ''
+    def durations = entries.collect { it.d as Long }
+    def fails = entries.collect { it.f as Integer }
+    def avgD = durations.sum() / durations.size()
+    def avgF = fails.sum() / fails.size()
+    def stdD = Math.sqrt(durations.collect { (it - avgD) ** 2 }.sum() / durations.size())
+    def stdF = Math.sqrt(fails.collect { (it - avgF) ** 2 }.sum() / fails.size())
+    def msgs = []
+    if (stdD > 0 && durationSec > avgD + 2 * stdD) {
+        msgs << "Duration ${durationSec}s is ~${(durationSec / avgD).intValue()}x recent avg (${avgD.intValue()}s)"
+    }
+    if (stdF > 0 && failedCount > avgF + 2 * stdF && failedCount > 0) {
+        msgs << "Fail count ${failedCount} much higher than recent avg (${avgF.intValue()})"
+    }
+    return msgs ? "Anomaly: " + msgs.join('; ') : ''
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -489,7 +664,7 @@ pipeline {
                     echo "[Setup] Sending start notification to Slack..."
                     def startMsg = """*Test Run Started*
 
-*Build:* <${env.BUILD_URL?.replace('localhost', 'skynet-studio.org')}|Jenkins #${BUILD_NUMBER}>
+*Build:* <${(env.BUILD_URL ?: '').replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')}|Jenkins #${BUILD_NUMBER}>
 *Branch:* `${(BUILD_CURRENT_BRANCH && BUILD_CURRENT_BRANCH != 'HEAD') ? BUILD_CURRENT_BRANCH : params.FLA_BRANCH}` | *Tag:* `${BUILD_TAG}`
 *Scheme:* `${params.SCHEME_NAME}`
 
@@ -742,6 +917,10 @@ _Commits:_
 
                     def durationSec = ((System.currentTimeMillis() - STARTTIME) / 1000).intValue()
                     def duration = formatDuration(durationSec)
+                    def summaryFlakyCount = 0
+                    def summaryRealCount = 0
+                    def summaryHasRerun = false
+                    def summaryFlakyTests = []
 
                     echo "────────────────────  Generate reports (JUnit, Allure, CSV)  ────────────────────"
                     echo "[Report] Generating reports (JUnit, Allure, CSV)..."
@@ -759,6 +938,12 @@ _Commits:_
                         FAILED_COUNT_1ST = counters.failed
                     }
 
+                    def extraLines = []
+                    def hints = getFailureHints(firstRunJunit)
+                    if (hints?.trim()) extraLines << "_${hints}_"
+                    def anomalyMsg = checkAnomaly(durationSec, counters.failed, counters.executed, JOB_NAME)
+                    if (anomalyMsg?.trim()) extraLines << "⚠️ ${anomalyMsg}"
+
                     echo "────────────────────  Send 1st run results to Slack  ────────────────────"
                     echo "[Report] Sending 1st run results to Slack..."
                     def slackMsg = buildSlackMessage(
@@ -767,7 +952,8 @@ _Commits:_
                         params.WORKERS,
                         FAILED_COUNT_1ST,
                         counters.executed,
-                        counters.disabled
+                        counters.disabled,
+                        extraLines
                     )
 
                     if (FAILED_COUNT_1ST != '0' && fileExists("${TEST_OUTPUT}/failed_tests.csv")) {
@@ -793,13 +979,25 @@ _Commits:_
                                 def rerunDuration = formatDuration(((System.currentTimeMillis() - RERUN_STARTTIME) / 1000).intValue())
                                 def rerunCounters = readTestCountersFromJunit(rerunJunit)
 
+                                def flakyReal = computeFlakyAndReal(firstRunJunit, rerunJunit, params.SCHEME_NAME)
+                                summaryFlakyCount = flakyReal.flakyCount
+                                summaryRealCount = flakyReal.realCount
+                                summaryHasRerun = true
+                                summaryFlakyTests = flakyReal.flakyTestNames ?: []
+
+                                def rerunExtra = []
+                                if (flakyReal.flakyNote?.trim()) rerunExtra << "_${flakyReal.flakyNote}_"
+                                def rerunHints = getFailureHints(rerunJunit)
+                                if (rerunHints?.trim()) rerunExtra << "_${rerunHints}_"
+
                                 def rerunMsg = buildSlackMessage(
                                     rerunCounters.failed == '0',
                                     "${JOB_NAME} (Rerun)", NOW, rerunDuration,
                                     '1',
                                     rerunCounters.failed,
                                     rerunCounters.executed,
-                                    '0'
+                                    '0',
+                                    rerunExtra
                                 )
 
                                 if (rerunCounters.failed != '0' && fileExists("${RERUN_TEST_OUTPUT}/failed_tests_rerun.csv")) {
@@ -810,6 +1008,26 @@ _Commits:_
                             }
                         }
                     }
+
+                    def timestampIso = sh(script: "date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%dT%H:%M:%S", returnStdout: true).trim()
+                    def runSummary = [
+                        job_name: JOB_NAME,
+                        build_id: BUILD_ID,
+                        scheme: params.SCHEME_NAME,
+                        timestamp_iso: timestampIso,
+                        duration_sec: durationSec,
+                        executed: counters.executed,
+                        failed: FAILED_COUNT_1ST,
+                        disabled: counters.disabled,
+                        flaky_count: summaryFlakyCount,
+                        real_count: summaryRealCount,
+                        failure_hints: hints?.trim() ?: '',
+                        anomaly: anomalyMsg?.trim() ?: '',
+                        has_rerun: summaryHasRerun,
+                        flaky_tests: summaryFlakyTests
+                    ]
+                    writeRunSummary(TEST_OUTPUT, runSummary)
+                    writeRunSummaryHtml(runSummary, TEST_OUTPUT)
                 }
             }
         }
@@ -863,8 +1081,17 @@ _Commits:_
                 reportName: 'Test Results'
             ])
 
+            publishHTML(target: [
+                allowMissing: true,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: TEST_OUTPUT_REL,
+                reportFiles: 'run_summary.html',
+                reportName: 'Run Summary'
+            ])
+
             archiveArtifacts(
-                artifacts: "${TEST_OUTPUT_REL}/report.xml, ${TEST_OUTPUT_REL}/failed_tests*.csv, ${TEST_OUTPUT_REL}/test-run.log, ${RERUN_TEST_OUTPUT_REL}/report.xml, ${RERUN_TEST_OUTPUT_REL}/failed_tests*.csv, ${RERUN_TEST_OUTPUT_REL}/test-run.log, Build/build-*.log",
+                artifacts: "${TEST_OUTPUT_REL}/report.xml, ${TEST_OUTPUT_REL}/failed_tests*.csv, ${TEST_OUTPUT_REL}/run_summary.json, ${TEST_OUTPUT_REL}/run_summary.html, ${TEST_OUTPUT_REL}/test-run.log, ${RERUN_TEST_OUTPUT_REL}/report.xml, ${RERUN_TEST_OUTPUT_REL}/failed_tests*.csv, ${RERUN_TEST_OUTPUT_REL}/test-run.log, Build/build-*.log",
                 allowEmptyArchive: true,
                 fingerprint: true
             )
@@ -881,7 +1108,7 @@ _Commits:_
             script {
                 def failureMsg = """*Build Failed*
 
-*Job:* `${JOB_NAME}` | *Build:* <${env.BUILD_URL?.replace('localhost', 'skynet-studio.org')}|#${BUILD_NUMBER}>
+*Job:* `${JOB_NAME}` | *Build:* <${(env.BUILD_URL ?: '').replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')}|#${BUILD_NUMBER}>
 
 Check logs for details."""
                 slackPostMessage(failureMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD ?: '')
