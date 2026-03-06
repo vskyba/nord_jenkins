@@ -50,7 +50,7 @@ def toJsonValue(Object v) {
 }
 
 def slackPostInitialMessage(String text, String channel) {
-    int maxAttempts = 3
+    int maxAttempts = 5
     int delaySec = 5
     def payload = toJsonValue([channel: channel, text: text])
     def payloadFile = "${env.WORKSPACE}/slack_payload_init.json"
@@ -99,7 +99,7 @@ def slackPostInitialMessage(String text, String channel) {
 }
 
 def slackPostMessage(String message, String channel, String thread) {
-    int maxAttempts = 3
+    int maxAttempts = 5
     int delaySec = 5
     def payload = thread?.trim() ?
         toJsonValue([channel: channel, thread_ts: thread.trim(), text: message]) :
@@ -146,29 +146,39 @@ def slackPostMessage(String message, String channel, String thread) {
     echo "Slack post failed after ${maxAttempts} attempts. Build continues."
 }
 
-/** Uploads a file to Slack (channel, optional thread) with initial comment. Uses Slack files.upload API so file appears in the same thread as the run. */
+/** Uploads a file to Slack (channel, optional thread) with initial comment. Uses Slack files.upload API. On failure, posts message only. */
 def uploadFileToSlack(String filePath, String text, String channel, String thread) {
     if (!fileExists(filePath)) {
         echo "Slack upload skipped: file not found: ${filePath}. Posting message only."
         slackPostMessage(text, channel, thread)
         return
     }
+    def threadVal = thread?.trim() ?: ''
     try {
         writeFile file: "${env.WORKSPACE}/.slack_upload_comment.txt", text: text ?: ''
-        def threadVal = thread?.trim() ?: ''
-        sh(script: """
+        def result = sh(script: """
             set +e
             comment=\$(cat "${env.WORKSPACE}/.slack_upload_comment.txt")
-            curl -4 -sS -X POST \\
+            _out=\$(curl -4 -sS -X POST \\
               -H "Authorization: Bearer \$SLACK_TOKEN" \\
               -F "channels=${channel}" \\
               -F "thread_ts=${threadVal}" \\
               -F "initial_comment=\$comment" \\
               -F "file=@${filePath}" \\
-              https://slack.com/api/files.upload
-            echo ""
-        """, returnStdout: true)
-        echo "Slack file upload requested for ${filePath} (channel=${channel}, thread=${threadVal ? 'yes' : 'no'})"
+              https://slack.com/api/files.upload 2>&1)
+            _ec=\$?
+            echo "\$_out"
+            echo "CURL_EXIT:\$_ec"
+        """, returnStdout: true).trim()
+        def lines = result.split('\n')
+        def curlExit = lines.find { it.startsWith('CURL_EXIT:') }?.replaceFirst('CURL_EXIT:', '') ?: '?'
+        def slackResponse = lines.findAll { !it.startsWith('CURL_EXIT:') }.join('\n').trim()
+        if (curlExit == '0' && slackResponse?.contains('"ok":true')) {
+            echo "Slack file upload succeeded for ${filePath}"
+        } else {
+            echo "Slack file upload failed (curl exit: ${curlExit}). Posting message only. Response: ${slackResponse.take(200)}"
+            slackPostMessage(text, channel, thread)
+        }
     } catch (Exception e) {
         echo "Slack file upload failed: ${e.message}. Posting message only."
         slackPostMessage(text, channel, thread)
@@ -200,17 +210,16 @@ def readSummaryCounts(String junitPath) {
     return out
 }
 
-def readTestCountersLegacy(String outputDir) {
-    def failed = sh(script: "cat ${outputDir}/how_many_failed 2>/dev/null || echo '0'", returnStdout: true).trim()
-    def executed = sh(script: "cat ${outputDir}/how_many_executed 2>/dev/null || echo '0'", returnStdout: true).trim()
-    def disabled = sh(script: "cat ${outputDir}/how_many_disabled 2>/dev/null || echo '0'", returnStdout: true).trim()
-    return [failed: failed, executed: executed, disabled: disabled]
-}
-
 def formatDuration(long durationSec) {
     def hours = (durationSec / 3600).intValue()
     def minutes = ((durationSec % 3600) / 60).intValue()
     return hours > 0 ? "${hours}h ${minutes}m" : "${minutes}m"
+}
+
+/** Normalized BUILD_URL for links (localhost → skynet-studio.org). */
+def normalizedBuildUrl() {
+    def raw = env.BUILD_URL ?: ''
+    return raw.replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
 }
 
 /** Builds Slack test-run summary. Pass disabled only for 1st run (null for rerun → not shown). */
@@ -219,8 +228,7 @@ def buildSlackMessage(boolean isSuccess, String jobName, String now, String dura
                       String disabled = null,
                       List<String> extraLines = []) {
     def status = isSuccess ? "Completed Successfully" : "Completed with Failures"
-    def rawUrl = env.BUILD_URL ?: ''
-    def buildUrl = rawUrl.replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
+    def buildUrl = normalizedBuildUrl()
     def buildLink = buildUrl ? "*Build:* <${buildUrl}|#${BUILD_NUMBER}>" : ""
     def allureReportUrl = buildUrl ? (buildUrl.endsWith('/') ? "${buildUrl}allure/" : "${buildUrl}/allure/") : ''
     def allureLink = allureReportUrl ? "\n*Allure Report:* <${allureReportUrl}|View report>" : ""
@@ -236,20 +244,6 @@ ${buildLink}${allureLink}
 
 *Summary*
 • Executed: `${executed}`  • Failed: `${failed}`  • Workers: `${workers}`${disabledPart}"""
-    if (extraLines) {
-        body += "\n\n" + extraLines.findAll { it?.trim() }.join("\n")
-    }
-    return body
-}
-
-/** Short Report-stage follow-up: Build + Allure (if failures) + extra lines. Use after "1st run completed" was already sent. */
-def buildReportFollowUpMessage(boolean hasFailures, List<String> extraLines = []) {
-    def rawUrl = env.BUILD_URL ?: ''
-    def buildUrl = rawUrl.replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
-    def buildLink = buildUrl ? "*Build:* <${buildUrl}|#${BUILD_NUMBER}>" : ""
-    def allureReportUrl = buildUrl ? (buildUrl.endsWith('/') ? "${buildUrl}allure/" : "${buildUrl}/allure/") : ''
-    def allurePart = (hasFailures && allureReportUrl) ? "\n*Allure:* <${allureReportUrl}|View report>" : ""
-    def body = "*Report ready.*\n\n${buildLink}${allurePart}"
     if (extraLines) {
         body += "\n\n" + extraLines.findAll { it?.trim() }.join("\n")
     }
@@ -699,10 +693,9 @@ pipeline {
 
                     echo "────────────────────  Send start notification to Slack  ────────────────────"
                     echo "[Setup] Sending start notification to Slack..."
-                    def buildUrlStart = (env.BUILD_URL ?: '').replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
                     def startMsg = """*Test Run Started*
 
-*Build:* <${buildUrlStart}|Jenkins #${BUILD_NUMBER}>
+*Build:* <${normalizedBuildUrl()}|Jenkins #${BUILD_NUMBER}>
 *Branch fla-ios:* `${params.FLA_BRANCH}`  •  *Branch intg-stubs:* `${params.INTG_BRANCH}`  •  *Tag:* `${BUILD_TAG}`
 *Scheme:* `${params.SCHEME_NAME}`
 
@@ -935,7 +928,7 @@ _Commits_
 ║  Extract failed tests from report.xml · rerun with single worker          ║
 ╚══════════════════════════════════════════════════════════════════════════╝"""
                     def firstRunJunit = "${TEST_OUTPUT}/report.xml"
-                    if (FAILED_COUNT_1ST == '0' || !FAILED_COUNT_1ST || FAILED_COUNT_1ST == 'null') {
+                    if (FAILED_COUNT_1ST == '0') {
                         echo "────────────────────  No failures, skip rerun  ────────────────────"
                         echo "No failures detected, skipping rerun"
                         RERUN_SKIPPED = true
@@ -1066,7 +1059,7 @@ _Commits_
                         timestamp_iso: timestampIso,
                         duration_sec: durationSec,
                         executed: counters.executed,
-                        failed: FAILED_COUNT_1ST,
+                        failed: counters.failed,
                         disabled: counters.disabled,
                         flaky_count: summaryFlakyCount,
                         real_count: summaryRealCount,
@@ -1110,14 +1103,14 @@ _Commits_
             junit(
                 testResults: "${TEST_OUTPUT_REL}/report.xml",
                 allowEmptyResults: true,
-                skipPublishingChecks: false,
+                skipPublishingChecks: true,
                 skipMarkingBuildUnstable: true
             )
 
             junit(
                 testResults: "${RERUN_TEST_OUTPUT_REL}/report.xml",
                 allowEmptyResults: true,
-                skipPublishingChecks: false,
+                skipPublishingChecks: true,
                 skipMarkingBuildUnstable: true
             )
 
@@ -1155,11 +1148,10 @@ _Commits_
 
         failure {
             script {
-                def buildUrlFail = (env.BUILD_URL ?: '').replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
                 def failureMsg = """*Build Failed*
 
 *Job:* `${JOB_NAME}`
-*Build:* <${buildUrlFail}|#${BUILD_NUMBER}>
+*Build:* <${normalizedBuildUrl()}|#${BUILD_NUMBER}>
 
 _Check logs for details._"""
                 slackPostMessage(failureMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD ?: '')
