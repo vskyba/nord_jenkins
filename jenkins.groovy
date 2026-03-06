@@ -12,42 +12,118 @@ def RERUN_SKIPPED = true
 def RERUN_TEST_OUTPUT = ''
 def STARTTIME = 0
 def RERUN_STARTTIME = 0
+// Parsed from SIMULATOR_DEVICE (device|runtime|optionalId)
+def DEVICE_NAME = ''
+def RUNTIME_VERSION = ''
+def SIMULATOR_ID = ''
 
 // ─────────────────────────────────────────────────────────────
 // ── HELPER METHODS ──────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────
 
 def slackPostInitialMessage(String text, String channel) {
-    def slackResponse = sh(
-        script: """
-            curl -s -X POST \
-                 -H "Authorization: Bearer \$SLACK_TOKEN" \
-                 -H "Content-Type: application/json" \
-                 -d '{"channel": "${channel}", "text": ${groovy.json.JsonOutput.toJson(text)}}' \
-                 https://slack.com/api/chat.postMessage
-        """,
-        returnStdout: true
-    ).trim()
+    int maxAttempts = 3
+    int delaySec = 5
+    def payload = groovy.json.JsonOutput.toJson([channel: channel, text: text])
+    def payloadFile = "${env.WORKSPACE}/slack_payload_init.json"
+    writeFile file: payloadFile, text: payload
 
-    def json = new JsonSlurper().parseText(slackResponse)
-    if (!json.ok) {
-        echo "Slack post failed: ${slackResponse}"
-        return ''
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        def result = sh(
+            script: """
+                set +e
+                _out=\$(curl -4 -sS --connect-timeout 15 --retry 2 --retry-delay 3 -X POST \
+                     -H "Authorization: Bearer \$SLACK_TOKEN" \
+                     -H "Content-Type: application/json; charset=utf-8" \
+                     -d @"${payloadFile}" \
+                     https://slack.com/api/chat.postMessage 2>&1)
+                echo "CURL_EXIT:\$?"
+                echo "\$_out"
+                exit 0
+            """,
+            returnStdout: true
+        ).trim()
+
+        def lines = result.split('\n')
+        def curlExit = lines.find { it.startsWith('CURL_EXIT:') }?.replaceFirst('CURL_EXIT:', '') ?: '?'
+        def slackResponse = lines.findAll { !it.startsWith('CURL_EXIT:') }.join('\n').trim()
+        echo "Slack API (start) attempt ${attempt}/${maxAttempts} (curl exit: ${curlExit}): ${slackResponse}"
+
+        if (curlExit == '0') {
+            try {
+                def json = new JsonSlurper().parseText(slackResponse)
+                if (json.ok) {
+                    return json.ts ?: ''
+                }
+                echo "Slack post failed: ${slackResponse}"
+            } catch (Exception e) {
+                echo "Slack response parse error: ${e.message}"
+            }
+        }
+
+        if (attempt < maxAttempts) {
+            echo "Retrying Slack start post in ${delaySec}s..."
+            sh(script: "sleep ${delaySec}", returnStatus: true)
+        }
     }
-    return json.ts ?: ''
+
+    echo "Slack start post failed after ${maxAttempts} attempts. Continuing without thread_ts."
+    return ''
 }
 
 def slackPostMessage(String message, String channel, String thread) {
-    sh(
-        script: """
-            curl -s -X POST \
-                 -H "Authorization: Bearer \$SLACK_TOKEN" \
-                 -H "Content-Type: application/json" \
-                 -d '{"channel": "${channel}", "thread_ts": "${thread}", "text": ${groovy.json.JsonOutput.toJson(message)}}' \
-                 https://slack.com/api/chat.postMessage
-        """,
-        returnStatus: true
-    )
+    int maxAttempts = 3
+    int delaySec = 5
+    def payload = thread?.trim() ?
+        groovy.json.JsonOutput.toJson([channel: channel, thread_ts: thread.trim(), text: message]) :
+        groovy.json.JsonOutput.toJson([channel: channel, text: message])
+    def payloadFile = "${env.WORKSPACE}/slack_payload.json"
+    writeFile file: payloadFile, text: payload
+
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        def result = sh(
+            script: """
+                set +e
+                _out=\$(curl -4 -sS --connect-timeout 15 --retry 2 --retry-delay 3 -X POST \
+                     -H "Authorization: Bearer \$SLACK_TOKEN" \
+                     -H "Content-Type: application/json; charset=utf-8" \
+                     -d @"${payloadFile}" \
+                     https://slack.com/api/chat.postMessage 2>&1)
+                echo "CURL_EXIT:\$?"
+                echo "\$_out"
+                exit 0
+            """,
+            returnStdout: true
+        ).trim()
+
+        def lines = result.split('\n')
+        def curlExit = lines.find { it.startsWith('CURL_EXIT:') }?.replaceFirst('CURL_EXIT:', '') ?: '?'
+        def slackResponse = lines.findAll { !it.startsWith('CURL_EXIT:') }.join('\n').trim()
+        echo "Slack API attempt ${attempt}/${maxAttempts} (curl exit: ${curlExit}): ${slackResponse}"
+
+        if (curlExit == '0') {
+            try {
+                if (slackResponse) {
+                    def json = new JsonSlurper().parseText(slackResponse)
+                    if (json.ok) {
+                        return
+                    }
+                    echo "Slack post failed: ${slackResponse}"
+                }
+            } catch (Exception e) {
+                echo "Slack response parse error: ${e.message}"
+            }
+        } else {
+            echo "Slack post may have failed (curl exit ${curlExit}, e.g. 6=resolve host)."
+        }
+
+        if (attempt < maxAttempts) {
+            echo "Retrying Slack post in ${delaySec}s..."
+            sh(script: "sleep ${delaySec}", returnStatus: true)
+        }
+    }
+
+    echo "Slack post failed after ${maxAttempts} attempts. Build continues."
 }
 
 def uploadFileToSlack(String filePath, String text, String channel, String thread) {
@@ -111,10 +187,12 @@ def formatDuration(long durationSec) {
 def buildSlackMessage(boolean isSuccess, String jobName, String now, String duration,
                       String workers, String failed, String executed, String disabled) {
     def status = isSuccess ? "Completed Successfully" : "Completed with Failures"
-    def allureLink = isSuccess ? "" : "\n*Allure Report:* <http://integration.nonprod.cmapps.vip.nordstrom.com:8080/job/${JOB_NAME}/${BUILD_NUMBER}/allure/|LINK>"
+    def buildUrl = (env.BUILD_URL ?: '').replace('localhost', 'skynet-studio.org')
+    def buildLink = buildUrl ? "\n*Build:* <${buildUrl}|#${BUILD_NUMBER}>" : ""
+    def allureLink = (isSuccess || !buildUrl) ? "" : "\n*Allure Report:* <${buildUrl}allure/|LINK>"
 
-    return """*Test Run ${status}!*
-${allureLink}
+    return """*Test Run ${status}!*${buildLink}${allureLink}
+
 *Job Name:* `${jobName}`
 *Start Time:* `${now}`
 *Duration:* `${duration}`
@@ -132,28 +210,36 @@ def runXCUITests(Map config) {
     def testMethodsArg = config.testMethods ?: ''
     // Reuse Build stage DerivedData (prebuild-once strategy, same as squad_specific_test_run.yml)
     def derivedDataPath = config.derivedDataPath ?: "${config.outputDir}/DerivedData"
+    def destination = (config.simulatorId ?: '').trim() ?
+        "id=${config.simulatorId}" :
+        "platform=iOS Simulator,name=${config.device},OS=${config.runtime}"
 
+    echo "Running tests: ${config.scheme} (parallel: ${!config.disableParallel}, full log: ${config.outputDir}/test-run.log)"
     def exitCode = sh(
         script: """
-            echo "Running tests: ${config.scheme} (parallel: ${!config.disableParallel})"
+            set +e
             export AUTOMATION_ENABLE_SHIPPED_FEATURE_FLAGS=${config.enableShipped}
-
             BUILD_ID=dontKillMe xcodebuild test \
                 -project Nordstrom.xcodeproj \
                 -scheme "${config.scheme}" \
-                -destination "platform=iOS Simulator,name=${config.device},OS=${config.runtime}" \
+                -destination "${destination}" \
                 ${parallelOptions} \
                 -onlyUsePackageVersionsFromResolvedFile \
                 -derivedDataPath "${derivedDataPath}" \
                 -resultBundlePath "${config.outputDir}/${config.resultName}.xcresult" \
                 -skipPackagePluginValidation \
                 -quiet \
-                ${testMethodsArg}
+                ${testMethodsArg ? testMethodsArg.split().collect { '"' + it.replaceAll('"', '\\\\"') + '"' }.join(' ') : ''} \
+                > "${config.outputDir}/test-run.log" 2>&1
+            _xc=\$?
+            echo "--- Last 100 lines of test run ---"
+            tail -100 "${config.outputDir}/test-run.log"
+            exit \$_xc
         """,
         returnStatus: true
     )
 
-    echo "xcodebuild exit code: ${exitCode}"
+    echo "xcodebuild test finished (exit code: ${exitCode})"
 
     // Exit code 0 = success, 65 = test failures (acceptable), others = infrastructure failure
     if (exitCode != 0 && exitCode != 65) {
@@ -246,14 +332,18 @@ pipeline {
             sortMode: 'ASCENDING_SMART'
         )
         choice(
-            name: 'DEVICE_NAME',
-            choices: ['iPhone 12', 'iPhone 12 Pro Max', 'iPhone SE', 'iPhone 16 Pro', 'iPhone 15', 'iPhone 14'],
-            description: 'iOS device for testing'
-        )
-        choice(
-            name: 'RUNTIME_VERSION',
-            choices: ['26.3.1', '18.0'],
-            description: 'iOS runtime version'
+            name: 'SIMULATOR_DEVICE',
+            choices: [
+                'iPhone 12|26.3.1|0D445113-3DEE-49CB-B377-6764CF67535E',
+                'iPhone 12|26.3.1',
+                'iPhone 12|18.0',
+                'iPhone 12 Pro Max|26.3.1',
+                'iPhone 16 Pro|26.3.1',
+                'iPhone 15|26.3.1',
+                'iPhone 14|26.3.1',
+                'iPhone SE|26.3.1'
+            ],
+            description: 'Simulator: Device | iOS version | optional UUID. Default: iPhone 12, 26.3.1 (ID 0D44...)'
         )
         choice(
             name: 'SCHEME_NAME',
@@ -307,10 +397,16 @@ pipeline {
         stage('Setup') {
             steps {
                 script {
+                    def parts = params.SIMULATOR_DEVICE.split('\\|')
+                    if (parts.size() >= 2) {
+                        DEVICE_NAME = parts[0].trim()
+                        RUNTIME_VERSION = parts[1].trim()
+                        SIMULATOR_ID = (parts.size() >= 3 && parts[2].trim()) ? parts[2].trim() : ''
+                    }
                     JOB_START_TIMESTAMP = sh(script: "date +%s", returnStdout: true).trim()
 
                     // ── Checkout repositories ──
-                    echo "═══ Checking out repositories ═══"
+                    echo "[Setup] Checking out repositories..."
                     checkout([
                         $class: 'GitSCM',
                         branches: [[name: "*/${params.FLA_BRANCH}"]],
@@ -332,7 +428,7 @@ pipeline {
                     }
 
                     // ── Collect build info ──
-                    echo "═══ Collecting build information ═══"
+                    echo "[Setup] Collecting build information..."
                     NOW = sh(script: "date +'%d/%m/%Y %r'", returnStdout: true).trim()
                     BUILD_TAG = sh(script: 'git describe --tags "$(git rev-list --tags --max-count=1)" 2>/dev/null || echo "untagged-$(git rev-parse --short HEAD)"', returnStdout: true).trim()
                     BUILD_LAST_COMMIT = sh(script: 'git log --pretty=format:"%h | %an: %s" -n 1 2>/dev/null || echo "N/A"', returnStdout: true).trim()
@@ -346,7 +442,7 @@ pipeline {
                     TEST_OUTPUT = "${env.WORKSPACE}/${TEST_OUTPUT_REL}"
 
                     // ── Validate inputs ──
-                    echo "═══ Validating inputs ═══"
+                    echo "[Setup] Validating inputs..."
                     def validationErrors = []
 
                     // Exact scheme match (align with squad_specific_test_run.yml validation)
@@ -355,14 +451,14 @@ pipeline {
                         validationErrors << "Scheme '${params.SCHEME_NAME}' not found in project"
                     }
 
-                    def deviceExists = sh(script: "xcrun simctl list devices 2>/dev/null | grep -q '${params.DEVICE_NAME}' && echo 'yes' || echo 'no'", returnStdout: true).trim()
+                    def deviceExists = sh(script: "xcrun simctl list devices 2>/dev/null | grep -q '${DEVICE_NAME}' && echo 'yes' || echo 'no'", returnStdout: true).trim()
                     if (deviceExists == 'no') {
-                        validationErrors << "Device '${params.DEVICE_NAME}' not found"
+                        validationErrors << "Device '${DEVICE_NAME}' not found"
                     }
 
-                    def runtimeExists = sh(script: "xcrun simctl list runtimes 2>/dev/null | grep -q 'iOS ${params.RUNTIME_VERSION}' && echo 'yes' || echo 'no'", returnStdout: true).trim()
+                    def runtimeExists = sh(script: "xcrun simctl list runtimes 2>/dev/null | grep -q 'iOS ${RUNTIME_VERSION}' && echo 'yes' || echo 'no'", returnStdout: true).trim()
                     if (runtimeExists == 'no') {
-                        validationErrors << "iOS ${params.RUNTIME_VERSION} runtime not found"
+                        validationErrors << "iOS ${RUNTIME_VERSION} runtime not found"
                     }
 
                     if (validationErrors) {
@@ -370,7 +466,7 @@ pipeline {
                     }
 
                     // ── Setup caches ──
-                    echo "═══ Setting up caches ═══"
+                    echo "[Setup] Setting up caches..."
                     sh """
                         mkdir -p "${COCOAPODS_CACHE}" "${BUNDLE_PATH}" "${SPM_CACHE_DIR}" || true
                         echo "Cache sizes:"
@@ -379,14 +475,14 @@ pipeline {
                     """
 
                     // ── Send Slack notification ──
-                    echo "═══ Sending start notification ═══"
+                    echo "[Setup] Sending start notification to Slack..."
                     def startMsg = """*Test Run Started*
 
-*Build:* <${env.BUILD_URL}|Jenkins #${BUILD_NUMBER}>
+*Build:* <${env.BUILD_URL?.replace('localhost', 'skynet-studio.org')}|Jenkins #${BUILD_NUMBER}>
 *Branch:* `${(BUILD_CURRENT_BRANCH && BUILD_CURRENT_BRANCH != 'HEAD') ? BUILD_CURRENT_BRANCH : params.FLA_BRANCH}` | *Tag:* `${BUILD_TAG}`
 *Scheme:* `${params.SCHEME_NAME}`
 
-*Config:* ${params.DEVICE_NAME} | iOS ${params.RUNTIME_VERSION} | ${params.WORKERS} workers
+*Config:* ${DEVICE_NAME} | iOS ${RUNTIME_VERSION} | ${params.WORKERS} workers
 
 _Commits:_
 • fla-ios: `${BUILD_LAST_COMMIT}`
@@ -406,7 +502,7 @@ _Commits:_
             steps {
                 script {
                     // ── Environment cleanup ──
-                    echo "═══ Cleaning environment ═══"
+                    echo "[Build] Cleaning environment..."
                     sh """
                         rake clean || true
                         killall Xcode Simulator 'Problem Reporter' 2>/dev/null || true
@@ -459,7 +555,7 @@ _Commits:_
                     }
 
                     // ── Build for testing (direct xcodebuild: avoids Rakefile treating warnings as failure) ──
-                    echo "═══ Building for testing ═══"
+                    echo "[Build] Building for testing (full log: Build/build-${params.SCHEME_NAME}.log)"
                     sh """
                         set -o pipefail
                         export SPM_CACHE_DIR="${SPM_CACHE_DIR}"
@@ -472,16 +568,17 @@ _Commits:_
                             -configuration AdHoc \\
                             -sdk iphonesimulator \\
                             -scheme "${params.SCHEME_NAME}" \\
-                            -destination 'generic/platform=iOS Simulator,OS=${params.RUNTIME_VERSION}' \\
+                            -destination 'generic/platform=iOS Simulator,OS=${RUNTIME_VERSION}' \\
                             -derivedDataPath "${env.WORKSPACE}/Build/DerivedData" \\
                             -onlyUsePackageVersionsFromResolvedFile \\
                             -skipPackagePluginValidation \\
                             2>&1 | tee "Build/build-${params.SCHEME_NAME}.log" \\
-                            | Build/bin/xcbeautify --quieter --disable-logging
+                            | Build/bin/xcbeautify --quieter --disable-logging | tail -80
                     """
+                    echo "[Build] Finished."
 
                     // ── Generate stubs ──
-                    echo "═══ Generating stubs ═══"
+                    echo "[Build] Generating stubs..."
                     sh """
                         /usr/bin/xcrun --sdk macosx swift run --package-path ./scripts/LocalStubServer-cli \
                             localstubserver-cli \
@@ -515,13 +612,14 @@ _Commits:_
                     }
 
                     // ── Run tests ──
-                    echo "═══ Running tests ═══"
+                    echo "[Test] Running tests (full log: ${TEST_OUTPUT}/test-run.log)"
                     sh "mkdir -p ${TEST_OUTPUT}"
 
                     runXCUITests(
                         scheme: params.SCHEME_NAME,
-                        device: params.DEVICE_NAME,
-                        runtime: params.RUNTIME_VERSION,
+                        device: DEVICE_NAME,
+                        runtime: RUNTIME_VERSION,
+                        simulatorId: SIMULATOR_ID,
                         workers: params.WORKERS,
                         outputDir: TEST_OUTPUT,
                         resultName: FILE_NAME_PATTERN,
@@ -565,8 +663,8 @@ _Commits:_
                         sh """
                             xcrun simctl erase all || true
                             BUILD_ID=dontKillMe ~/scripts/rerunTests_xml.py \
-                                "${firstRunJunit}" "${params.SCHEME_NAME}" "${params.DEVICE_NAME}" \
-                                "${params.RUNTIME_VERSION}" "${TEST_OUTPUT}/DerivedData/SourcePackages" || true
+                                "${firstRunJunit}" "${params.SCHEME_NAME}" "${DEVICE_NAME}" \
+                                "${RUNTIME_VERSION}" "${TEST_OUTPUT}/DerivedData/SourcePackages" || true
                         """
                         RERUN_TEST_OUTPUT = "${env.WORKSPACE}/${RERUN_TEST_OUTPUT_REL}"
                         return
@@ -582,8 +680,9 @@ _Commits:_
 
                     runXCUITests(
                         scheme: params.SCHEME_NAME,
-                        device: params.DEVICE_NAME,
-                        runtime: params.RUNTIME_VERSION,
+                        device: DEVICE_NAME,
+                        runtime: RUNTIME_VERSION,
+                        simulatorId: SIMULATOR_ID,
                         workers: '1',
                         outputDir: RERUN_TEST_OUTPUT,
                         resultName: "${FILE_NAME_PATTERN}_rerun",
@@ -609,7 +708,7 @@ _Commits:_
                     def duration = formatDuration(durationSec)
 
                     // ── Generate 1st run reports ──
-                    echo "═══ Generating reports ═══"
+                    echo "[Report] Generating reports (JUnit, Allure, CSV)..."
                     def firstRunJunit = "${TEST_OUTPUT}/report.xml"
 
                     if (!fileExists(firstRunJunit)) {
@@ -629,7 +728,8 @@ _Commits:_
                     }
 
                     // ── Send 1st run Slack notification ──
-                    echo "═══ Sending 1st run results ═══"
+                    // Note: If a prior stage (e.g. Rerun) fails, Report is skipped and this message is never sent.
+                    echo "[Report] Sending 1st run results to Slack..."
                     def slackMsg = buildSlackMessage(
                         FAILED_COUNT_1ST == '0',
                         JOB_NAME, NOW, duration,
@@ -650,7 +750,7 @@ _Commits:_
                         if (RERUN_SKIPPED) {
                             slackPostMessage("_Rerun skipped - no failures in 1st run_", params.REPORT_CHANNEL, SLACK_CURRENT_THREAD)
                         } else if (RERUN_TEST_OUTPUT && fileExists("${RERUN_TEST_OUTPUT}")) {
-                            echo "═══ Generating rerun reports ═══"
+                            echo "[Report] Generating rerun reports..."
 
                             def rerunJunit = "${RERUN_TEST_OUTPUT}/report.xml"
                             sh "f=\$(find \"${RERUN_TEST_OUTPUT}\" -maxdepth 1 -name '*.xcresult' 2>/dev/null | head -1); [ -n \"\$f\" ] && ./Build/bin/xcresultparser -o junit \"\$f\" > ${rerunJunit} || true"
@@ -729,7 +829,7 @@ _Commits:_
             ])
 
             archiveArtifacts(
-                artifacts: "${TEST_OUTPUT_REL}/report.xml, ${TEST_OUTPUT_REL}/failed_tests*.csv, ${RERUN_TEST_OUTPUT_REL}/report.xml, ${RERUN_TEST_OUTPUT_REL}/failed_tests*.csv, Build/specs-*.log",
+                artifacts: "${TEST_OUTPUT_REL}/report.xml, ${TEST_OUTPUT_REL}/failed_tests*.csv, ${TEST_OUTPUT_REL}/test-run.log, ${RERUN_TEST_OUTPUT_REL}/report.xml, ${RERUN_TEST_OUTPUT_REL}/failed_tests*.csv, ${RERUN_TEST_OUTPUT_REL}/test-run.log, Build/build-*.log",
                 allowEmptyArchive: true,
                 fingerprint: true
             )
@@ -746,7 +846,7 @@ _Commits:_
             script {
                 def failureMsg = """*Build Failed*
 
-*Job:* `${JOB_NAME}` | *Build:* <${env.BUILD_URL}|#${BUILD_NUMBER}>
+*Job:* `${JOB_NAME}` | *Build:* <${env.BUILD_URL?.replace('localhost', 'skynet-studio.org')}|#${BUILD_NUMBER}>
 
 Check logs for details."""
                 slackPostMessage(failureMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD ?: '')
