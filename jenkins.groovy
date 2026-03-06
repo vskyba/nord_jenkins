@@ -554,6 +554,10 @@ _Commits:_
                         """
                     }
 
+                    // ── Regenerate Xcode project (removes stale file references after deletions) ──
+                    echo "[Build] Regenerating Xcode project..."
+                    sh "bundle exec rake prebuild"
+
                     // ── Build for testing (direct xcodebuild: avoids Rakefile treating warnings as failure) ──
                     echo "[Build] Building for testing (full log: Build/build-${params.SCHEME_NAME}.log)"
                     sh """
