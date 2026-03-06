@@ -1,5 +1,5 @@
 /* groovylint-disable GStringExpressionWithinString, LineLength */
-import groovy.json.JsonSlurper
+// Avoid groovy.json.JsonSlurper in pipeline: it returns LazyMap which causes NotSerializableException when Jenkins serializes state.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ═  GLOBAL STATE
@@ -19,7 +19,6 @@ def SIMULATOR_ID = ''
 def NOW = ''
 def BUILD_TAG = ''
 def BUILD_LAST_COMMIT = ''
-def BUILD_CURRENT_BRANCH = ''
 def STUBS_COMMIT = ''
 def FILE_NAME_PATTERN = ''
 def TEST_OUTPUT_REL = ''
@@ -29,12 +28,31 @@ def TEST_OUTPUT = ''
 // ═══════════════════════════════════════════════════════════════════════════
 // ═  HELPERS
 // ═  Slack API, test counters, duration formatting, xcodebuild test runner
+// ═  JSON built manually to stay within Jenkins script-security sandbox.
 // ═══════════════════════════════════════════════════════════════════════════
+
+/** Sandbox-safe: escape string for JSON value (so Slack receives newlines as \\n in JSON). */
+def escapeForJson(Object s) {
+    if (s == null) return 'null'
+    def t = s.toString()
+    return '"' + t.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r') + '"'
+}
+
+/** Sandbox-safe: serialize value to JSON (no JsonOutput). */
+def toJsonValue(Object v) {
+    if (v == null) return 'null'
+    if (v instanceof Boolean) return v ? 'true' : 'false'
+    if (v instanceof Number) return v.toString()
+    if (v instanceof String) return escapeForJson(v)
+    if (v instanceof List) return '[' + v.collect { toJsonValue(it) }.join(',') + ']'
+    if (v instanceof Map) return '{' + v.entrySet().collect { escapeForJson(it.key.toString()) + ':' + toJsonValue(it.value) }.join(',') + '}'
+    return escapeForJson(v.toString())
+}
 
 def slackPostInitialMessage(String text, String channel) {
     int maxAttempts = 3
     int delaySec = 5
-    def payload = groovy.json.JsonOutput.toJson([channel: channel, text: text])
+    def payload = toJsonValue([channel: channel, text: text])
     def payloadFile = "${env.WORKSPACE}/slack_payload_init.json"
     writeFile file: payloadFile, text: payload
 
@@ -59,15 +77,14 @@ def slackPostInitialMessage(String text, String channel) {
         def slackResponse = lines.findAll { !it.startsWith('CURL_EXIT:') }.join('\n').trim()
         echo "Slack API (start) attempt ${attempt}/${maxAttempts} (curl exit: ${curlExit}): ${slackResponse}"
 
-        if (curlExit == '0') {
-            try {
-                def json = new JsonSlurper().parseText(slackResponse)
-                if (json.ok) {
-                    return json.ts ?: ''
+        if (curlExit == '0' && slackResponse?.trim()) {
+            if (slackResponse.contains('"ok":true')) {
+                def matcher = (slackResponse =~ /"ts"\s*:\s*"([^"]+)"/)
+                if (matcher.find()) {
+                    return matcher.group(1) ?: ''
                 }
+            } else {
                 echo "Slack post failed: ${slackResponse}"
-            } catch (Exception e) {
-                echo "Slack response parse error: ${e.message}"
             }
         }
 
@@ -85,8 +102,8 @@ def slackPostMessage(String message, String channel, String thread) {
     int maxAttempts = 3
     int delaySec = 5
     def payload = thread?.trim() ?
-        groovy.json.JsonOutput.toJson([channel: channel, thread_ts: thread.trim(), text: message]) :
-        groovy.json.JsonOutput.toJson([channel: channel, text: message])
+        toJsonValue([channel: channel, thread_ts: thread.trim(), text: message]) :
+        toJsonValue([channel: channel, text: message])
     def payloadFile = "${env.WORKSPACE}/slack_payload.json"
     writeFile file: payloadFile, text: payload
 
@@ -111,18 +128,11 @@ def slackPostMessage(String message, String channel, String thread) {
         def slackResponse = lines.findAll { !it.startsWith('CURL_EXIT:') }.join('\n').trim()
         echo "Slack API attempt ${attempt}/${maxAttempts} (curl exit: ${curlExit}): ${slackResponse}"
 
-        if (curlExit == '0') {
-            try {
-                if (slackResponse) {
-                    def json = new JsonSlurper().parseText(slackResponse)
-                    if (json.ok) {
-                        return
-                    }
-                    echo "Slack post failed: ${slackResponse}"
-                }
-            } catch (Exception e) {
-                echo "Slack response parse error: ${e.message}"
+        if (curlExit == '0' && slackResponse?.trim()) {
+            if (slackResponse.contains('"ok":true')) {
+                return
             }
+            echo "Slack post failed: ${slackResponse}"
         } else {
             echo "Slack post may have failed (curl exit ${curlExit}, e.g. 6=resolve host)."
         }
@@ -136,46 +146,58 @@ def slackPostMessage(String message, String channel, String thread) {
     echo "Slack post failed after ${maxAttempts} attempts. Build continues."
 }
 
+/** Uploads a file to Slack (channel, optional thread) with initial comment. Uses Slack files.upload API so file appears in the same thread as the run. */
 def uploadFileToSlack(String filePath, String text, String channel, String thread) {
+    if (!fileExists(filePath)) {
+        echo "Slack upload skipped: file not found: ${filePath}. Posting message only."
+        slackPostMessage(text, channel, thread)
+        return
+    }
     try {
-        slackUploadFile(
-            credentialId: 'SLACK_TOKEN',
-            channel: thread ? "${channel}:${thread}" : channel,
-            filePath: filePath,
-            initialComment: text,
-            failOnError: false
-        )
+        writeFile file: "${env.WORKSPACE}/.slack_upload_comment.txt", text: text ?: ''
+        def threadVal = thread?.trim() ?: ''
+        sh(script: """
+            set +e
+            comment=\$(cat "${env.WORKSPACE}/.slack_upload_comment.txt")
+            curl -4 -sS -X POST \\
+              -H "Authorization: Bearer \$SLACK_TOKEN" \\
+              -F "channels=${channel}" \\
+              -F "thread_ts=${threadVal}" \\
+              -F "initial_comment=\$comment" \\
+              -F "file=@${filePath}" \\
+              https://slack.com/api/files.upload
+            echo ""
+        """, returnStdout: true)
+        echo "Slack file upload requested for ${filePath} (channel=${channel}, thread=${threadVal ? 'yes' : 'no'})"
     } catch (Exception e) {
-        echo "Slack file upload failed: ${e.message}"
+        echo "Slack file upload failed: ${e.message}. Posting message only."
+        slackPostMessage(text, channel, thread)
     }
 }
 
 /**
- * Reads JUnit summary counts (failed, executed, disabled) from fla-ios Reports.
+ * Reads test counts from a JUnit report using Reports.summary_counts only.
+ * Returns [failed, executed, disabled] as strings; uses '0' when file missing or parse fails.
+ * Call with the path to the JUnit XML for that run (first run or rerun).
  */
-def readTestCountersFromJunit(String junitPath) {
-    def counters = [failed: 'null', executed: 'null', disabled: 'null']
-    if (!fileExists(junitPath)) {
-        return counters
-    }
-    // Path via env so Ruby -e stays single-quoted (avoids zsh glob)
+def readSummaryCounts(String junitPath) {
+    def safe = { v -> (v != null && v != 'null' && v?.trim() != '') ? v.trim() : '0' }
+    def out = [failed: '0', executed: '0', disabled: '0']
+    if (!fileExists(junitPath)) return out
     def result = sh(
         script: """
             export JUNIT_PATH="${junitPath}"
-            bundle exec ruby -r ./ruby/project/test.rb -e 'counts = Project::Test::Reports.summary_counts(ENV[\"JUNIT_PATH\"]); puts \"failed=\" + counts[:failed].to_s; puts \"executed=\" + counts[:executed].to_s; puts \"disabled=\" + counts[:disabled].to_s' 2>/dev/null || true
+            bundle exec ruby -r ./ruby/project/test.rb -e 'c = Project::Test::Reports.summary_counts(ENV[\"JUNIT_PATH\"]); puts \"failed=\"+c[:failed].to_s; puts \"executed=\"+c[:executed].to_s; puts \"disabled=\"+c[:disabled].to_s' 2>/dev/null || true
         """,
         returnStdout: true
     ).trim()
-
     result.split('\n').each { line ->
         def parts = line.split('=', 2)
-        if (parts.size() == 2) {
-            def key = parts[0].trim()
-            def val = parts[1].trim()
-            if (counters.containsKey(key)) { counters[key] = val }
+        if (parts.size() == 2 && out.containsKey(parts[0].trim())) {
+            out[parts[0].trim()] = safe(parts[1].trim())
         }
     }
-    return counters
+    return out
 }
 
 def readTestCountersLegacy(String outputDir) {
@@ -191,25 +213,43 @@ def formatDuration(long durationSec) {
     return hours > 0 ? "${hours}h ${minutes}m" : "${minutes}m"
 }
 
+/** Builds Slack test-run summary. Pass disabled only for 1st run (null for rerun → not shown). */
 def buildSlackMessage(boolean isSuccess, String jobName, String now, String duration,
-                      String workers, String failed, String executed, String disabled,
+                      String workers, String failed, String executed,
+                      String disabled = null,
                       List<String> extraLines = []) {
     def status = isSuccess ? "Completed Successfully" : "Completed with Failures"
     def rawUrl = env.BUILD_URL ?: ''
     def buildUrl = rawUrl.replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
-    def buildLink = buildUrl ? "\n*Build:* <${buildUrl}|#${BUILD_NUMBER}>" : ""
+    def buildLink = buildUrl ? "*Build:* <${buildUrl}|#${BUILD_NUMBER}>" : ""
     def allureReportUrl = buildUrl ? (buildUrl.endsWith('/') ? "${buildUrl}allure/" : "${buildUrl}/allure/") : ''
-    def allureLink = (isSuccess || !allureReportUrl) ? "" : "\n*Allure Report:* <${allureReportUrl}|LINK>"
+    def allureLink = allureReportUrl ? "\n*Allure Report:* <${allureReportUrl}|View report>" : ""
+    def disabledPart = (disabled != null && disabled != '') ? "  • Disabled: `${disabled}`" : ""
 
-    def body = """*Test Run ${status}!*${buildLink}${allureLink}
+    def body = """*Test Run ${status}*
 
-*Job Name:* `${jobName}`
-*Start Time:* `${now}`
+${buildLink}${allureLink}
+
+*Job:* `${jobName}`
+*Started:* `${now}`
 *Duration:* `${duration}`
 
-*Test Summary:*
-- *Workers:* `${workers}`
-- *Executed:* `${executed}` | *Failed:* `${failed}` | *Disabled:* `${disabled}`"""
+*Summary*
+• Executed: `${executed}`  • Failed: `${failed}`  • Workers: `${workers}`${disabledPart}"""
+    if (extraLines) {
+        body += "\n\n" + extraLines.findAll { it?.trim() }.join("\n")
+    }
+    return body
+}
+
+/** Short Report-stage follow-up: Build + Allure (if failures) + extra lines. Use after "1st run completed" was already sent. */
+def buildReportFollowUpMessage(boolean hasFailures, List<String> extraLines = []) {
+    def rawUrl = env.BUILD_URL ?: ''
+    def buildUrl = rawUrl.replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
+    def buildLink = buildUrl ? "*Build:* <${buildUrl}|#${BUILD_NUMBER}>" : ""
+    def allureReportUrl = buildUrl ? (buildUrl.endsWith('/') ? "${buildUrl}allure/" : "${buildUrl}/allure/") : ''
+    def allurePart = (hasFailures && allureReportUrl) ? "\n*Allure:* <${allureReportUrl}|View report>" : ""
+    def body = "*Report ready.*\n\n${buildLink}${allurePart}"
     if (extraLines) {
         body += "\n\n" + extraLines.findAll { it?.trim() }.join("\n")
     }
@@ -264,11 +304,9 @@ def runXCUITests(Map config) {
     return exitCode
 }
 
+/** Converts xcresult to JUnit XML using xcresultparser (available on server). */
 def generateJunitReport(String xcresultPath, String outputPath) {
-    sh """
-        ./Build/bin/xcresultparser -o junit "${xcresultPath}" > "${outputPath}" 2>/dev/null || \
-        xcresultparser -o junit "${xcresultPath}" > "${outputPath}" 2>/dev/null || true
-    """
+    sh "xcresultparser -o junit \"${xcresultPath}\" > \"${outputPath}\" 2>/dev/null || true"
 
     if (fileExists(outputPath)) {
         // Normalize failure messages; path via env for safe Ruby -e
@@ -335,7 +373,8 @@ def getFailureHints(String junitPath) {
         keywords.keySet().each { k ->
             keywords[k] = lower.count { it.contains(k) }
         }
-        def buckets = keywords.findAll { it.value > 0 }.sort { -it.value }.take(3)
+        def sorted = keywords.findAll { it.value > 0 }.sort { -it.value }
+        def buckets = sorted.size() > 3 ? sorted[0..2] : sorted
         if (buckets.isEmpty()) return ''
         return "Hints: " + buckets.collect { "${it.key} (${it.value})" }.join(', ')
     } catch (Exception e) {
@@ -347,7 +386,7 @@ def getFailureHints(String junitPath) {
 /** Writes run_summary.json (run-level metrics + flaky/hints/anomaly) for archiving and dashboards. */
 def writeRunSummary(String outputDir, Map summary) {
     def path = "${outputDir}/run_summary.json"
-    writeFile file: path, text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(summary))
+    writeFile file: path, text: toJsonValue(summary)
     echo "Written ${path}"
 }
 
@@ -363,7 +402,7 @@ def escapeHtml(String s) {
 
 /** Generates run_summary.html for visualising run summary (open from Jenkins artifacts or Run Summary report). */
 def writeRunSummaryHtml(Map summary, String outputDir) {
-    def json = groovy.json.JsonOutput.toJson(summary)
+    def json = toJsonValue(summary)
     def jsonEscaped = json.replace('\\', '\\\\').replace('</', '<\\/').replace('<!--', '<\\!--')
     def hintsEscaped = escapeHtml(summary.failure_hints as String)
     def anomalyEscaped = escapeHtml(summary.anomaly as String)
@@ -437,15 +476,14 @@ def checkAnomaly(long durationSec, String failedCountStr, String executedCountSt
     def entries = []
     try {
         def raw = sh(script: "cat '${baselineFile}' 2>/dev/null || echo '[]'", returnStdout: true).trim()
-        def slurper = new groovy.json.JsonSlurper()
-        entries = slurper.parseText(raw) as List
-        if (entries == null) entries = []
+        // Assign only the collected list (plain maps); never hold parseText result (LazyMap) in a variable.
+        entries = ((new groovy.json.JsonSlurper().parseText(raw)) as List).collect { [d: (it?.d ?: 0) as Long, f: (it?.f ?: 0) as Integer] }
     } catch (Exception e) {
         echo "Baseline read skipped: ${e.message}"
     }
     entries << [d: durationSec, f: failedCount]
     if (entries.size() > keep) entries = entries[-keep..-1]
-    def json = groovy.json.JsonOutput.toJson(entries)
+    def json = '[' + entries.collect { "{\"d\":${it.d},\"f\":${it.f}}" }.join(',') + ']'
     def tmpFile = "${env.WORKSPACE}/.baseline_tmp.json"
     writeFile file: tmpFile, text: json
     sh "mkdir -p '${baselineDir}' && cp '${tmpFile}' '${baselineFile}'"
@@ -620,7 +658,6 @@ pipeline {
                     NOW = sh(script: "date +'%d/%m/%Y %r'", returnStdout: true).trim()
                     BUILD_TAG = sh(script: 'git describe --tags "$(git rev-list --tags --max-count=1)" 2>/dev/null || echo "untagged-$(git rev-parse --short HEAD)"', returnStdout: true).trim()
                     BUILD_LAST_COMMIT = sh(script: 'git log --pretty=format:"%h | %an: %s" -n 1 2>/dev/null || echo "N/A"', returnStdout: true).trim()
-                    BUILD_CURRENT_BRANCH = sh(script: 'git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""', returnStdout: true).trim()
                     STUBS_COMMIT = sh(script: 'cd integration-tests-stubs && git log --pretty=format:"%h | %an: %s" -n 1 2>/dev/null || echo "N/A"', returnStdout: true).trim()
 
                     FILE_NAME_PATTERN = "${JOB_NAME}_${BUILD_ID}_${BUILD_TAG}"
@@ -662,15 +699,16 @@ pipeline {
 
                     echo "────────────────────  Send start notification to Slack  ────────────────────"
                     echo "[Setup] Sending start notification to Slack..."
+                    def buildUrlStart = (env.BUILD_URL ?: '').replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
                     def startMsg = """*Test Run Started*
 
-*Build:* <${(env.BUILD_URL ?: '').replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')}|Jenkins #${BUILD_NUMBER}>
-*Branch:* `${(BUILD_CURRENT_BRANCH && BUILD_CURRENT_BRANCH != 'HEAD') ? BUILD_CURRENT_BRANCH : params.FLA_BRANCH}` | *Tag:* `${BUILD_TAG}`
+*Build:* <${buildUrlStart}|Jenkins #${BUILD_NUMBER}>
+*Branch fla-ios:* `${params.FLA_BRANCH}`  •  *Branch intg-stubs:* `${params.INTG_BRANCH}`  •  *Tag:* `${BUILD_TAG}`
 *Scheme:* `${params.SCHEME_NAME}`
 
-*Config:* ${DEVICE_NAME} | iOS ${RUNTIME_VERSION} | ${params.WORKERS} workers
+*Config:* ${DEVICE_NAME}  •  iOS ${RUNTIME_VERSION}  •  ${params.WORKERS} workers
 
-_Commits:_
+_Commits_
 • fla-ios: `${BUILD_LAST_COMMIT}`
 • stubs: `${STUBS_COMMIT}`"""
 
@@ -834,8 +872,58 @@ _Commits:_
         }
 
         // ┌─────────────────────────────────────────────────────────────────────┐
-        // │  STAGE 4: RERUN FAILED (optional)                                   │
-        // │  JUnit from 1st run · extract failed tests · rerun with single worker
+        // │  STAGE 4: REPORT 1ST RUN                                            │
+        // │  JUnit · CSV · Allure for 1st run · Slack with Build + Allure + CSV │
+        // └─────────────────────────────────────────────────────────────────────┘
+        stage('Report 1st Run') {
+            steps {
+                script {
+                    echo """
+╔══════════════════════════════════════════════════════════════════════════╗
+║  STAGE 4: REPORT 1ST RUN                                                 ║
+║  JUnit · CSV · Allure · Slack (Build + Allure link + failed_tests.csv)   ║
+╚══════════════════════════════════════════════════════════════════════════╝"""
+                    def firstRunJunit = "${TEST_OUTPUT}/report.xml"
+                    echo "────────────────────  Generate 1st run reports  ────────────────────"
+                    generateJunitReport("${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult", firstRunJunit)
+                    generateFailedTestsCsv(firstRunJunit, "${TEST_OUTPUT}/failed_tests.csv")
+                    sh "~/scripts/xcresults export ${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult ${TEST_OUTPUT}/allure-results 2>/dev/null || true"
+                    sh "mkdir -p ~/JenkinsTestResults/${JOB_NAME} && cp ${firstRunJunit} ~/JenkinsTestResults/${JOB_NAME}/${BUILD_ID}.xml || true"
+
+                    def counters = readSummaryCounts(firstRunJunit)
+                    FAILED_COUNT_1ST = counters.failed
+                    def durationSec = ((System.currentTimeMillis() - STARTTIME) / 1000).intValue()
+                    def duration = formatDuration(durationSec)
+
+                    def extraLines = []
+                    def hints = getFailureHints(firstRunJunit)
+                    if (hints?.trim()) extraLines << "_${hints}_"
+                    def anomalyMsg = checkAnomaly(durationSec, counters.failed, counters.executed, JOB_NAME)
+                    if (anomalyMsg?.trim()) extraLines << "⚠️ ${anomalyMsg}"
+
+                    echo "────────────────────  Send 1st run to Slack (Build + Allure + CSV)  ────────────────────"
+                    def firstRunSlackMsg = buildSlackMessage(
+                        counters.failed == '0',
+                        JOB_NAME, NOW, duration,
+                        params.WORKERS,
+                        counters.failed,
+                        counters.executed,
+                        counters.disabled,
+                        extraLines
+                    )
+
+                    if (counters.failed != '0' && fileExists("${TEST_OUTPUT}/failed_tests.csv")) {
+                        uploadFileToSlack("${TEST_OUTPUT}/failed_tests.csv", firstRunSlackMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD)
+                    } else {
+                        slackPostMessage(firstRunSlackMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD)
+                    }
+                }
+            }
+        }
+
+        // ┌─────────────────────────────────────────────────────────────────────┐
+        // │  STAGE 5: RERUN FAILED (optional)                                   │
+        // │  Extract failed tests from report.xml · rerun with single worker     │
         // └─────────────────────────────────────────────────────────────────────┘
         stage('Rerun Failed') {
             when { expression { return params.RERUN_ENABLED } }
@@ -843,16 +931,11 @@ _Commits:_
                 script {
                     echo """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  STAGE 4: RERUN FAILED (optional)                                        ║
-║  JUnit from 1st run · extract failed tests · rerun with single worker    ║
+║  STAGE 5: RERUN FAILED (optional)                                        ║
+║  Extract failed tests from report.xml · rerun with single worker          ║
 ╚══════════════════════════════════════════════════════════════════════════╝"""
                     def firstRunJunit = "${TEST_OUTPUT}/report.xml"
-                    generateJunitReport("${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult", firstRunJunit)
-
-                    def counters = readTestCountersFromJunit(firstRunJunit)
-                    FAILED_COUNT_1ST = counters.failed
-
-                    if (FAILED_COUNT_1ST == '0' || !FAILED_COUNT_1ST) {
+                    if (FAILED_COUNT_1ST == '0' || !FAILED_COUNT_1ST || FAILED_COUNT_1ST == 'null') {
                         echo "────────────────────  No failures, skip rerun  ────────────────────"
                         echo "No failures detected, skipping rerun"
                         RERUN_SKIPPED = true
@@ -902,65 +985,28 @@ _Commits:_
         }
 
         // ┌─────────────────────────────────────────────────────────────────────┐
-        // │  STAGE 5: REPORT                                                    │
-        // │  Cleansimulators · JUnit/Allure/CSV · Slack 1st run · rerun reports
+        // │  STAGE 6: REPORT (rerun + run_summary)                               │
+        // │  Cleansimulators · rerun Slack · run_summary.json/html              │
         // └─────────────────────────────────────────────────────────────────────┘
         stage('Report') {
             steps {
                 script {
                     echo """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  STAGE 5: REPORT                                                         ║
-║  Cleansimulators · JUnit/Allure/CSV · Slack 1st run · rerun reports      ║
+║  STAGE 6: REPORT                                                         ║
+║  Cleansimulators · rerun Slack · run_summary.json/html                   ║
 ╚══════════════════════════════════════════════════════════════════════════╝"""
                     sh "bundle exec rake cleansimulators 2>/dev/null || true"
 
                     def durationSec = ((System.currentTimeMillis() - STARTTIME) / 1000).intValue()
-                    def duration = formatDuration(durationSec)
                     def summaryFlakyCount = 0
                     def summaryRealCount = 0
                     def summaryHasRerun = false
                     def summaryFlakyTests = []
-
-                    echo "────────────────────  Generate reports (JUnit, Allure, CSV)  ────────────────────"
-                    echo "[Report] Generating reports (JUnit, Allure, CSV)..."
                     def firstRunJunit = "${TEST_OUTPUT}/report.xml"
-
-                    if (!fileExists(firstRunJunit)) {
-                        generateJunitReport("${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult", firstRunJunit)
-                    }
-                    generateFailedTestsCsv(firstRunJunit, "${TEST_OUTPUT}/failed_tests.csv")
-                    sh "~/scripts/xcresults export ${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult ${TEST_OUTPUT}/allure-results 2>/dev/null || true"
-                    sh "mkdir -p ~/JenkinsTestResults/${JOB_NAME} && cp ${firstRunJunit} ~/JenkinsTestResults/${JOB_NAME}/${BUILD_ID}.xml || true"
-
-                    def counters = readTestCountersFromJunit(firstRunJunit)
-                    if (FAILED_COUNT_1ST == '0') {
-                        FAILED_COUNT_1ST = counters.failed
-                    }
-
-                    def extraLines = []
+                    def counters = readSummaryCounts(firstRunJunit)
                     def hints = getFailureHints(firstRunJunit)
-                    if (hints?.trim()) extraLines << "_${hints}_"
                     def anomalyMsg = checkAnomaly(durationSec, counters.failed, counters.executed, JOB_NAME)
-                    if (anomalyMsg?.trim()) extraLines << "⚠️ ${anomalyMsg}"
-
-                    echo "────────────────────  Send 1st run results to Slack  ────────────────────"
-                    echo "[Report] Sending 1st run results to Slack..."
-                    def slackMsg = buildSlackMessage(
-                        FAILED_COUNT_1ST == '0',
-                        JOB_NAME, NOW, duration,
-                        params.WORKERS,
-                        FAILED_COUNT_1ST,
-                        counters.executed,
-                        counters.disabled,
-                        extraLines
-                    )
-
-                    if (FAILED_COUNT_1ST != '0' && fileExists("${TEST_OUTPUT}/failed_tests.csv")) {
-                        uploadFileToSlack("${TEST_OUTPUT}/failed_tests.csv", slackMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD)
-                    } else {
-                        slackPostMessage(slackMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD)
-                    }
 
                     if (params.RERUN_ENABLED) {
                         if (RERUN_SKIPPED) {
@@ -970,14 +1016,17 @@ _Commits:_
                             echo "[Report] Generating rerun reports..."
 
                             def rerunJunit = "${RERUN_TEST_OUTPUT}/report.xml"
-                            sh "f=\$(find \"${RERUN_TEST_OUTPUT}\" -maxdepth 1 -name '*.xcresult' 2>/dev/null | head -1); [ -n \"\$f\" ] && ./Build/bin/xcresultparser -o junit \"\$f\" > ${rerunJunit} || true"
+                            def rerunXcresult = sh(script: "find \"${RERUN_TEST_OUTPUT}\" -maxdepth 1 -name '*.xcresult' 2>/dev/null | head -1", returnStdout: true).trim()
+                            if (rerunXcresult) {
+                                generateJunitReport(rerunXcresult, rerunJunit)
+                            }
 
                             if (fileExists(rerunJunit)) {
                                 generateFailedTestsCsv(rerunJunit, "${RERUN_TEST_OUTPUT}/failed_tests_rerun.csv")
                                 sh "cp ${rerunJunit} ~/JenkinsTestResults/${JOB_NAME}/${BUILD_ID}_rerun.xml || true"
 
                                 def rerunDuration = formatDuration(((System.currentTimeMillis() - RERUN_STARTTIME) / 1000).intValue())
-                                def rerunCounters = readTestCountersFromJunit(rerunJunit)
+                                def rerunCounters = readSummaryCounts(rerunJunit)
 
                                 def flakyReal = computeFlakyAndReal(firstRunJunit, rerunJunit, params.SCHEME_NAME)
                                 summaryFlakyCount = flakyReal.flakyCount
@@ -996,7 +1045,7 @@ _Commits:_
                                     '1',
                                     rerunCounters.failed,
                                     rerunCounters.executed,
-                                    '0',
+                                    null,
                                     rerunExtra
                                 )
 
@@ -1106,11 +1155,13 @@ _Commits:_
 
         failure {
             script {
+                def buildUrlFail = (env.BUILD_URL ?: '').replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')
                 def failureMsg = """*Build Failed*
 
-*Job:* `${JOB_NAME}` | *Build:* <${(env.BUILD_URL ?: '').replaceAll('(?i)localhost', 'skynet-studio.org').replace('127.0.0.1', 'skynet-studio.org')}|#${BUILD_NUMBER}>
+*Job:* `${JOB_NAME}`
+*Build:* <${buildUrlFail}|#${BUILD_NUMBER}>
 
-Check logs for details."""
+_Check logs for details._"""
                 slackPostMessage(failureMsg, params.REPORT_CHANNEL, SLACK_CURRENT_THREAD ?: '')
             }
         }
