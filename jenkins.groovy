@@ -212,6 +212,7 @@ def runXCUITests(Map config) {
         "id=${config.simulatorId}" :
         "platform=iOS Simulator,name=${config.device},OS=${config.runtime}"
 
+    echo "────────────────────  xcodebuild test: ${config.scheme}  ────────────────────"
     echo "Running tests: ${config.scheme} (parallel: ${!config.disableParallel}, full log: ${config.outputDir}/test-run.log)"
     def exitCode = sh(
         script: """
@@ -230,13 +231,14 @@ def runXCUITests(Map config) {
                 ${testMethodsArg ? testMethodsArg.split().collect { '"' + it.replaceAll('"', '\\\\"') + '"' }.join(' ') : ''} \
                 > "${config.outputDir}/test-run.log" 2>&1
             _xc=\$?
-            echo "--- Last 100 lines of test run ---"
+            echo "────────────────────  Last 100 lines of test run  ────────────────────"
             tail -100 "${config.outputDir}/test-run.log"
             exit \$_xc
         """,
         returnStatus: true
     )
 
+    echo "────────────────────  xcodebuild test finished (exit code: ${exitCode})  ────────────────────"
     echo "xcodebuild test finished (exit code: ${exitCode})"
     // Exit: 0 = success, 65 = test failures (ok), other = infrastructure failure
     if (exitCode != 0 && exitCode != 65) {
@@ -394,6 +396,11 @@ pipeline {
         stage('Setup') {
             steps {
                 script {
+                    echo """
+╔══════════════════════════════════════════════════════════════════════════╗
+║  STAGE 1: SETUP                                                         ║
+║  Checkout fla-ios + integration-tests-stubs · validate · caches · Slack  ║
+╚══════════════════════════════════════════════════════════════════════════╝"""
                     def parts = params.SIMULATOR_DEVICE.split('\\|')
                     if (parts.size() >= 2) {
                         DEVICE_NAME = parts[0].trim()
@@ -402,6 +409,7 @@ pipeline {
                     }
                     JOB_START_TIMESTAMP = sh(script: "date +%s", returnStdout: true).trim()
 
+                    echo "────────────────────  Checkout repositories  ────────────────────"
                     echo "[Setup] Checking out repositories..."
                     checkout([
                         $class: 'GitSCM',
@@ -423,6 +431,7 @@ pipeline {
                         ])
                     }
 
+                    echo "────────────────────  Collect build information  ────────────────────"
                     echo "[Setup] Collecting build information..."
                     NOW = sh(script: "date +'%d/%m/%Y %r'", returnStdout: true).trim()
                     BUILD_TAG = sh(script: 'git describe --tags "$(git rev-list --tags --max-count=1)" 2>/dev/null || echo "untagged-$(git rev-parse --short HEAD)"', returnStdout: true).trim()
@@ -435,6 +444,7 @@ pipeline {
                     RERUN_TEST_OUTPUT_REL = 'fastlane/rerun_test_output'
                     TEST_OUTPUT = "${env.WORKSPACE}/${TEST_OUTPUT_REL}"
 
+                    echo "────────────────────  Validate inputs  ────────────────────"
                     echo "[Setup] Validating inputs..."
                     def validationErrors = []
 
@@ -457,6 +467,7 @@ pipeline {
                         validationErrors.each { echo "WARNING: ${it}" }
                     }
 
+                    echo "────────────────────  Setup caches  ────────────────────"
                     echo "[Setup] Setting up caches..."
                     sh """
                         mkdir -p "${COCOAPODS_CACHE}" "${BUNDLE_PATH}" "${SPM_CACHE_DIR}" || true
@@ -465,6 +476,7 @@ pipeline {
                         du -sh "${BUNDLE_PATH}" 2>/dev/null || echo "  Bundle: empty"
                     """
 
+                    echo "────────────────────  Send start notification to Slack  ────────────────────"
                     echo "[Setup] Sending start notification to Slack..."
                     def startMsg = """*Test Run Started*
 
@@ -491,6 +503,12 @@ _Commits:_
         stage('Build') {
             steps {
                 script {
+                    echo """
+╔══════════════════════════════════════════════════════════════════════════╗
+║  STAGE 2: BUILD                                                          ║
+║  Clean env · xcbeautify · ACKNOWLEDGEMENTS · prebuild · build-for-testing · stubs
+╚══════════════════════════════════════════════════════════════════════════╝"""
+                    echo "────────────────────  Clean environment  ────────────────────"
                     echo "[Build] Cleaning environment..."
                     sh """
                         rake clean || true
@@ -513,7 +531,7 @@ _Commits:_
                         echo "Using: \$(xcode-select -p)"
                     """
 
-                    // ──  Rakefile expects Build/bin/xcbeautify  ─────────────────────────────
+                    echo "────────────────────  xcbeautify (Build/bin)  ────────────────────"
                     sh """
                         mkdir -p Build/bin
                         if [ ! -x Build/bin/xcbeautify ] && command -v xcbeautify >/dev/null 2>&1; then
@@ -525,7 +543,7 @@ _Commits:_
                         fi
                     """
 
-                    // ──  Xcode copy phase requires fla-ios/ACKNOWLEDGEMENTS.txt  ──────────────
+                    echo "────────────────────  fla-ios/ACKNOWLEDGEMENTS.txt  ────────────────────"
                     sh """
                         if [ ! -f fla-ios/ACKNOWLEDGEMENTS.txt ]; then
                             mkdir -p fla-ios
@@ -534,7 +552,7 @@ _Commits:_
                         fi
                     """
 
-                    // ──  Prebuild (bundle install + rake prebuild) then build-for-testing  ──
+                    echo "────────────────────  Prebuild (bundle install + rake prebuild)  ────────────────────"
                     withCredentials([string(credentialsId: 'ARTIFACTORY_TOKEN', variable: 'ARTIFACTORY_TOKEN')]) {
                         withEnv(['CI=', "ARTIFACTORY_TOKEN=${env.ARTIFACTORY_TOKEN}"]) {
                             sh """
@@ -547,6 +565,7 @@ _Commits:_
                             """
                         }
                     }
+                    echo "────────────────────  Build for testing (xcodebuild)  ────────────────────"
                     echo "[Build] Building for testing (full log: Build/build-${params.SCHEME_NAME}.log)"
                     sh """
                         set -o pipefail
@@ -569,7 +588,7 @@ _Commits:_
                     """
                     echo "[Build] Finished."
 
-                    // ──  Generate stubs (LocalStubServer-cli)  ─────────────────────────────────
+                    echo "────────────────────  Generate stubs (LocalStubServer-cli)  ────────────────────"
                     echo "[Build] Generating stubs..."
                     sh """
                         /usr/bin/xcrun --sdk macosx swift run --package-path ./scripts/LocalStubServer-cli \
@@ -588,10 +607,16 @@ _Commits:_
         stage('Test') {
             steps {
                 script {
+                    echo """
+╔══════════════════════════════════════════════════════════════════════════╗
+║  STAGE 3: TEST                                                          ║
+║  Resolve test methods (if any) · run xcodebuild test · reuse DerivedData ║
+╚══════════════════════════════════════════════════════════════════════════╝"""
                     STARTTIME = System.currentTimeMillis()
 
                     def testMethods = ''
                     if (params.TEST_METHODS?.trim()) {
+                        echo "────────────────────  Resolve test methods  ────────────────────"
                         echo "Resolving specific test methods: ${params.TEST_METHODS}"
                         testMethods = sh(
                             script: """
@@ -603,6 +628,7 @@ _Commits:_
                         ).trim()
                     }
 
+                    echo "────────────────────  Run xcodebuild test  ────────────────────"
                     echo "[Test] Running tests (full log: ${TEST_OUTPUT}/test-run.log)"
                     sh "mkdir -p ${TEST_OUTPUT}"
 
@@ -631,6 +657,11 @@ _Commits:_
             when { expression { return params.RERUN_ENABLED } }
             steps {
                 script {
+                    echo """
+╔══════════════════════════════════════════════════════════════════════════╗
+║  STAGE 4: RERUN FAILED (optional)                                        ║
+║  JUnit from 1st run · extract failed tests · rerun with single worker    ║
+╚══════════════════════════════════════════════════════════════════════════╝"""
                     def firstRunJunit = "${TEST_OUTPUT}/report.xml"
                     generateJunitReport("${TEST_OUTPUT}/${FILE_NAME_PATTERN}.xcresult", firstRunJunit)
 
@@ -638,6 +669,7 @@ _Commits:_
                     FAILED_COUNT_1ST = counters.failed
 
                     if (FAILED_COUNT_1ST == '0' || !FAILED_COUNT_1ST) {
+                        echo "────────────────────  No failures, skip rerun  ────────────────────"
                         echo "No failures detected, skipping rerun"
                         RERUN_SKIPPED = true
                         return
@@ -649,6 +681,7 @@ _Commits:_
                     def failedTests = extractFailedTestMethods(firstRunJunit, params.SCHEME_NAME)
 
                     if (!failedTests?.trim()) {
+                        echo "────────────────────  Legacy rerun (extract failed tests)  ────────────────────"
                         echo "Could not extract failed tests, using legacy rerun"
                         sh """
                             xcrun simctl erase all || true
@@ -660,6 +693,7 @@ _Commits:_
                         return
                     }
 
+                    echo "────────────────────  Rerun failed tests (single worker)  ────────────────────"
                     echo "Rerunning ${FAILED_COUNT_1ST} failed test(s)"
                     sh "xcrun simctl erase all || true"
 
@@ -690,11 +724,17 @@ _Commits:_
         stage('Report') {
             steps {
                 script {
+                    echo """
+╔══════════════════════════════════════════════════════════════════════════╗
+║  STAGE 5: REPORT                                                         ║
+║  Cleansimulators · JUnit/Allure/CSV · Slack 1st run · rerun reports       ║
+╚══════════════════════════════════════════════════════════════════════════╝"""
                     sh "bundle exec rake cleansimulators 2>/dev/null || true"
 
                     def durationSec = ((System.currentTimeMillis() - STARTTIME) / 1000).intValue()
                     def duration = formatDuration(durationSec)
 
+                    echo "────────────────────  Generate reports (JUnit, Allure, CSV)  ────────────────────"
                     echo "[Report] Generating reports (JUnit, Allure, CSV)..."
                     def firstRunJunit = "${TEST_OUTPUT}/report.xml"
 
@@ -710,6 +750,7 @@ _Commits:_
                         FAILED_COUNT_1ST = counters.failed
                     }
 
+                    echo "────────────────────  Send 1st run results to Slack  ────────────────────"
                     echo "[Report] Sending 1st run results to Slack..."
                     def slackMsg = buildSlackMessage(
                         FAILED_COUNT_1ST == '0',
@@ -730,6 +771,7 @@ _Commits:_
                         if (RERUN_SKIPPED) {
                             slackPostMessage("_Rerun skipped - no failures in 1st run_", params.REPORT_CHANNEL, SLACK_CURRENT_THREAD)
                         } else if (RERUN_TEST_OUTPUT && fileExists("${RERUN_TEST_OUTPUT}")) {
+                            echo "────────────────────  Generate rerun reports  ────────────────────"
                             echo "[Report] Generating rerun reports..."
 
                             def rerunJunit = "${RERUN_TEST_OUTPUT}/report.xml"
@@ -771,6 +813,11 @@ _Commits:_
     post {
         always {
             script {
+                echo """
+╔══════════════════════════════════════════════════════════════════════════╗
+║  POST · Cleanup · Allure · JUnit · HTML · archive · UNSTABLE→SUCCESS     ║
+╚══════════════════════════════════════════════════════════════════════════╝"""
+                echo "────────────────────  Cleanup  ────────────────────"
                 sh """
                     killall Simulator Xcode 'Problem Reporter' 2>/dev/null || true
                     echo "Job duration: \$(( (\$(date +%s) - ${JOB_START_TIMESTAMP}) / 60 )) minutes"
