@@ -16,6 +16,15 @@ def RERUN_STARTTIME = 0
 def DEVICE_NAME = ''
 def RUNTIME_VERSION = ''
 def SIMULATOR_ID = ''
+def NOW = ''
+def BUILD_TAG = ''
+def BUILD_LAST_COMMIT = ''
+def BUILD_CURRENT_BRANCH = ''
+def STUBS_COMMIT = ''
+def FILE_NAME_PATTERN = ''
+def TEST_OUTPUT_REL = ''
+def RERUN_TEST_OUTPUT_REL = ''
+def TEST_OUTPUT = ''
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ═  HELPERS
